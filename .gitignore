@@ -1,0 +1,23 @@
+# ---- data / artifacts ----
+data/
+results/
+*.npy
+*.npz
+*.memmap
+*.pickle
+*.pkl
+*.parquet
+*.csv
+
+# ---- python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# ---- jupyter ----
+.ipynb_checkpoints/
+
+# ---- macOS ----
+.DS_Store

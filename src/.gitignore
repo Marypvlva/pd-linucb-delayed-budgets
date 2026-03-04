@@ -1,0 +1,10 @@
+data/
+*.npy
+*.npz
+*.memmap
+results/raw/
+__pycache__/
+*.pyc
+.venv/
+.env
+.DS_Store
