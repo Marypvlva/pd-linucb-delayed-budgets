@@ -1,11 +1,11 @@
-# paper_cbwk_delays — Contextual BwK/CBwK with delayed feedback (PD-LinUCB) on Criteo Attribution
+# pd-linucb-delayed-budgets (paper_cbwk_delays)
 
-Прототип к статье про **контекстные бандиты с бюджетным ограничением (BwK/CBwK)** и **задержанным фидбеком**.  
-Фокус: воспроизводимая эмпирика на полном датасете **Criteo Attribution** с хранением данных в `numpy.memmap`,
+Прототип к статье про **контекстные бандиты с бюджетным ограничением (BwK/CBwK)** и **задержанным фидбеком**.
+Фокус: воспроизводимая крупномасштабная эмпирика на **Criteo Attribution** с хранением данных в `numpy.memmap`,
 протоколом **stop-at-budget**, и сравнением:
 
 - **LinUCB** (Disjoint)
-- **Primal–Dual LinUCB (PD-LinUCB)** (динамический множитель/“теневая цена” ресурса)
+- **Primal–Dual LinUCB (PD-LinUCB)** (динамический множитель / “теневая цена” ресурса)
 - **CostNormUCB** (ratio/sub)
 - **Context-free PD-BwK** (абляция “без контекста”)
 
