@@ -1,9 +1,16 @@
 # src/eval/run_compare_baselines.py
 from __future__ import annotations
 
+# ---- allow running as a script from repo root (python src/eval/run_compare_baselines.py) ----
+import sys
+from pathlib import Path
+_THIS = Path(__file__).resolve()
+_REPO_ROOT = _THIS.parents[2]  # .../paper_cbwk_delays
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 import argparse
 import csv
-from pathlib import Path
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -52,9 +59,8 @@ def run_contextual_algo(
 
     for t in range(T):
         # apply arrived reward feedback
-        if t in pending:
-            for (a_upd, x_upd, r_upd) in pending[t]:
-                algo.update_reward(a_upd, x_upd, r_upd)
+        for (a_upd, x_upd, r_upd) in pending.pop(t, []):
+            algo.update_reward(a_upd, x_upd, r_upd)
 
         x = X_seq[t]
         a = algo.select(x)
@@ -126,9 +132,8 @@ def run_context_free_pd(
     t_stop = T
 
     for t in range(T):
-        if t in pending:
-            for (a_upd, r_upd) in pending[t]:
-                algo.update(a_upd, r_upd)
+        for (a_upd, r_upd) in pending.pop(t, []):
+            algo.update(a_upd, r_upd)
 
         a = algo.select(t)
         c = float(env.costs[a])
@@ -209,7 +214,7 @@ def main():
 
     X_seq = env.sample_contexts(args.T)
 
-    B = args.budget_ratio * args.T
+    B = float(args.budget_ratio) * float(args.T)
 
     # instantiate methods
     lin = DisjointLinUCB(env.K, env.d, alpha=args.alpha_lin, lam=args.lam, seed=args.seed + 1)
@@ -303,40 +308,93 @@ def main():
 
     outdir = Path("results")
     outdir.mkdir(parents=True, exist_ok=True)
-    suf = f"_{args.tag}" if args.tag else ""
 
-    # Plot cumulative cost (spent) + budget + ideal spend line
-    # Plot cumulative spend with Budget B and ideal schedule (t/T)*B
-    x = np.arange(1, args.T + 1, dtype=np.float64)        # 1..T
-    ideal = (x / float(args.T)) * float(B)                # (t/T)*B
+    def save_base_and_tag(basename: str, dpi: int = 200):
+        """
+        Always save basename.png.
+        If --tag provided, also save basename_{tag}.png (so article can reference a fixed tag name).
+        """
+        plt.savefig(outdir / f"{basename}.png", dpi=dpi)
+        if args.tag:
+            plt.savefig(outdir / f"{basename}_{args.tag}.png", dpi=dpi)
 
+    x = np.arange(1, args.T + 1, dtype=np.float64)  # 1..T
+    ideal = (x / float(args.T)) * float(B)          # (t/T)*B
+
+    # ---------------- Figure 1: cumulative reward ----------------
+    plt.figure()
+    plt.plot(x, res_lin["cum_r"], label="LinUCB")
+    plt.plot(x, res_pd["cum_r"], label="PD-LinUCB")
+    plt.plot(x, res_cnu["cum_r"], label=f"CostNormUCB[{args.mode_cnu}]")
+    plt.plot(x, res_cf["cum_r"], label="CF-PD-BwK")
+    plt.title("Cumulative reward (stop-at-budget)")
+    plt.xlabel("t")
+    plt.ylabel("reward")
+    plt.xlim(1, args.T)
+    plt.legend()
+    plt.tight_layout()
+    save_base_and_tag("baselines_cum_reward_full4_arm", dpi=200)
+    plt.close()
+
+    # ---------------- Figure 2: cumulative cost ----------------
     plt.figure()
     plt.plot(x, res_lin["cum_c"], label="LinUCB")
     plt.plot(x, res_pd["cum_c"], label="PD-LinUCB")
     plt.plot(x, res_cnu["cum_c"], label=f"CostNormUCB[{args.mode_cnu}]")
     plt.plot(x, res_cf["cum_c"], label="CF-PD-BwK")
-
-    plt.plot(x, ideal, linestyle=":", label="Ideal spend (t/T)·B")
     plt.axhline(B, linestyle="--", label="Budget B")
-
-    plt.title("Cumulative spend (stop-at-budget)")
+    plt.title("Cumulative cost (stop-at-budget)")
     plt.xlabel("t")
     plt.ylabel("spent")
     plt.xlim(1, args.T)
-    plt.ylim(0.0, 1.05 * B)   # чтобы было компактно и без огромных полей
+    plt.ylim(0.0, 1.05 * B)
     plt.legend()
     plt.tight_layout()
-    plt.savefig(outdir / f"baselines_spent_schedule{suf}.png", dpi=200)
+    save_base_and_tag("baselines_cum_cost_full4_arm", dpi=200)
+    plt.close()
 
-    # rho = B/T (budget_ratio) is a constraint level, not the PD target b_t
+    # ---------------- Figure 3: cumulative spend + ideal schedule ----------------
+    plt.figure()
+    plt.plot(x, res_lin["cum_c"], label="LinUCB")
+    plt.plot(x, res_pd["cum_c"], label="PD-LinUCB")
+    plt.plot(x, res_cnu["cum_c"], label=f"CostNormUCB[{args.mode_cnu}]")
+    plt.plot(x, res_cf["cum_c"], label="CF-PD-BwK")
+    plt.plot(x, ideal, linestyle=":", label="Ideal spend (t/T)·B")
+    plt.axhline(B, linestyle="--", label="Budget B")
+    plt.title("Cumulative spend vs budget schedule (stop-at-budget)")
+    plt.xlabel("t")
+    plt.ylabel("spent")
+    plt.xlim(1, args.T)
+    plt.ylim(0.0, 1.05 * B)
+    plt.legend()
+    plt.tight_layout()
+    save_base_and_tag("baselines_spent_schedule", dpi=200)
+    plt.close()
+
+    # ---------------- Figure 4: running-average cost per step ----------------
+    def plot_running_avg_cost(res, label: str):
+        t_stop = int(res["t_stop"])
+        if t_stop <= 0:
+            return
+        t_axis = np.arange(1, t_stop + 1, dtype=np.float64)
+        cbar = res["cum_c"][:t_stop] / t_axis
+        plt.plot(t_axis, cbar, label=label)
+
+    plt.figure()
+    plot_running_avg_cost(res_lin, "LinUCB")
+    plot_running_avg_cost(res_pd, "PD-LinUCB")
+    plot_running_avg_cost(res_cnu, f"CostNormUCB[{args.mode_cnu}]")
+    plot_running_avg_cost(res_cf, "CF-PD-BwK")
     plt.axhline(float(args.budget_ratio), linestyle="--", label=r"$\rho=B/T$")
-
     plt.title("Running-average cost per step (stop-at-budget)")
     plt.xlabel("t (until stop-at-budget)")
     plt.ylabel(r"$\bar c_t = \mathrm{spent}_t / t$")
     plt.legend(ncol=2)
     plt.tight_layout()
-    plt.savefig(outdir / f"avg_cost_per_step{suf}.png", dpi=220)
+    # base: avg_cost_per_step.png; tagged: avg_cost_per_step_rho0.7.png (if --tag rho0.7)
+    save_base_and_tag("avg_cost_per_step", dpi=220)
+    plt.close()
+
 
 if __name__ == "__main__":
     main()

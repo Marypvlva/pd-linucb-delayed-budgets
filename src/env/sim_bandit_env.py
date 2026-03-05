@@ -97,9 +97,9 @@ class SimBanditEnv:
         XtX_arm = meta_stats["XtX_arm"].astype(np.float64)  # (K,d,d)
         XtR_arm = meta_stats["XtR_arm"].astype(np.float64)  # (K,d)
         if XtX_arm.shape != (K, d, d):
-            raise ValueError(f"XtX_arm shape mismatch: expected {(K,d,d)}, got {XtX_arm.shape}")
+            raise ValueError(f"XtX_arm shape mismatch: expected {(K, d, d)}, got {XtX_arm.shape}")
         if XtR_arm.shape != (K, d):
-            raise ValueError(f"XtR_arm shape mismatch: expected {(K,d)}, got {XtR_arm.shape}")
+            raise ValueError(f"XtR_arm shape mismatch: expected {(K, d)}, got {XtR_arm.shape}")
 
         Theta = np.zeros((K, d), dtype=np.float64)
         I = np.eye(d, dtype=np.float64)
@@ -134,7 +134,7 @@ class SimBanditEnv:
         X = np.load(p / "X.npy", mmap_mode="r")
         D = np.load(p / "D.npy", mmap_mode="r")
         if X.shape != (n, d):
-            raise ValueError(f"X shape mismatch: expected {(n,d)}, got {X.shape}")
+            raise ValueError(f"X shape mismatch: expected {(n, d)}, got {X.shape}")
         if D.shape[0] != n:
             raise ValueError(f"D length mismatch: expected {n}, got {D.shape[0]}")
 
@@ -168,14 +168,18 @@ class SimBanditEnv:
 
             # normalize to mean~1 to keep budget_ratio=B/T interpretable
             if normalize_costs:
-                if "cnt_a" in meta_stats.files:
-                    cnt_a = meta_stats["cnt_a"].astype(np.float64).reshape(-1)
-                    if cnt_a.shape[0] == K and float(np.sum(cnt_a)) > 0:
-                        mean_cost = float(np.sum(costs * cnt_a) / np.sum(cnt_a))
-                    else:
-                        mean_cost = float(np.mean(costs))
+                # IMPORTANT: memmap_full pipeline saves cnt_arm (not cnt_a).
+                cnt = None
+                if "cnt_arm" in meta_stats.files:
+                    cnt = meta_stats["cnt_arm"].astype(np.float64).reshape(-1)
+                elif "cnt_a" in meta_stats.files:
+                    cnt = meta_stats["cnt_a"].astype(np.float64).reshape(-1)
+
+                if cnt is not None and cnt.shape[0] == K and float(np.sum(cnt)) > 0:
+                    mean_cost = float(np.sum(costs * cnt) / np.sum(cnt))
                 else:
                     mean_cost = float(np.mean(costs))
+
                 mean_cost = max(mean_cost, 1e-12)
                 costs = costs / mean_cost
 
@@ -191,7 +195,7 @@ class SimBanditEnv:
                 raise ValueError("arm_ridge_stats.npz exists but has no 'Theta'")
             Theta = arm["Theta"].astype(np.float32)
             if Theta.shape != (K, d):
-                raise ValueError(f"Theta shape mismatch: expected {(K,d)}, got {Theta.shape}")
+                raise ValueError(f"Theta shape mismatch: expected {(K, d)}, got {Theta.shape}")
             return cls(
                 X_data=X, D_data=D, costs=costs, rng=rng,
                 delay_pool=delay_pool, censor_steps=censor_steps,
@@ -207,17 +211,39 @@ class SimBanditEnv:
             )
 
         # ---- fallback: global linear w + per-arm bias b ----
+        # (not used in the memmap_full Criteo pipeline; kept for compatibility with other artifacts)
+        if ("XtX" not in meta_stats.files) or ("XtR" not in meta_stats.files):
+            raise ValueError(
+                "No arm-specific reward model found (Theta / XtX_arm+XtR_arm), "
+                "and no global (XtX, XtR) stats present. "
+                f"Available keys: {list(meta_stats.files)}"
+            )
+
         XtX = meta_stats["XtX"].astype(np.float64)
         XtR = meta_stats["XtR"].astype(np.float64)
         w = np.linalg.solve(XtX + ridge_lambda * np.eye(d), XtR).astype(np.float32)
 
-        sum_r = meta_stats["sum_r"].astype(np.float64)
-        cnt_a = meta_stats["cnt_a"].astype(np.float64)
-        sum_x = meta_stats["sum_x"].astype(np.float64)
+        # per-arm bias: try common key variants
+        sum_r = None
+        cnt = None
+        sum_x = None
 
-        mean_r = sum_r / np.maximum(cnt_a, 1.0)
-        mean_x = sum_x / np.maximum(cnt_a[:, None], 1.0)
-        b = (mean_r - (mean_x @ w.astype(np.float64))).astype(np.float32)
+        if ("sum_r_arm" in meta_stats.files) and ("cnt_arm" in meta_stats.files) and ("sum_x_arm" in meta_stats.files):
+            sum_r = meta_stats["sum_r_arm"].astype(np.float64)
+            cnt = meta_stats["cnt_arm"].astype(np.float64)
+            sum_x = meta_stats["sum_x_arm"].astype(np.float64)
+        elif ("sum_r" in meta_stats.files) and ("cnt_a" in meta_stats.files) and ("sum_x" in meta_stats.files):
+            sum_r = meta_stats["sum_r"].astype(np.float64)
+            cnt = meta_stats["cnt_a"].astype(np.float64)
+            sum_x = meta_stats["sum_x"].astype(np.float64)
+
+        if sum_r is None or cnt is None or sum_x is None:
+            # if bias stats not available, set to zeros (still provides a valid model)
+            b = np.zeros((K,), dtype=np.float32)
+        else:
+            mean_r = sum_r / np.maximum(cnt, 1.0)
+            mean_x = sum_x / np.maximum(cnt[:, None], 1.0)
+            b = (mean_r - (mean_x @ w.astype(np.float64))).astype(np.float32)
 
         return cls(
             X_data=X, D_data=D, costs=costs, rng=rng,

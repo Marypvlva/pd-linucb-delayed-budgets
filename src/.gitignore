@@ -8,3 +8,16 @@ __pycache__/
 .venv/
 .env
 .DS_Store
+# --- local env ---
+.venv/
+__pycache__/
+*.pyc
+
+# --- data (DO NOT COMMIT) ---
+data/raw/
+data/processed/
+
+# --- experiment outputs (DO NOT COMMIT) ---
+results/
+results_before_costfix_*/
+results_before_*/

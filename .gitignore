@@ -1,23 +1,54 @@
-# ---- data / artifacts ----
-data/
-results/
-*.npy
-*.npz
-*.memmap
-*.pickle
-*.pkl
-*.parquet
-*.csv
-
-# ---- python ----
+# --- Python / venv ---
 __pycache__/
-*.py[cod]
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
 .venv/
 venv/
-.env
 
-# ---- jupyter ----
-.ipynb_checkpoints/
-
-# ---- macOS ----
+# --- OS / IDE ---
 .DS_Store
+.idea/
+.vscode/
+
+# --- LaTeX build artifacts ---
+*.aux
+*.bbl
+*.blg
+*.log
+*.out
+*.toc
+*.lof
+*.lot
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+
+# --- Data (DO NOT COMMIT) ---
+data/raw/
+data/processed/
+# (optional: keep a README in those folders)
+!data/raw/README.md
+!data/processed/README.md
+
+# --- Experiment outputs (DO NOT COMMIT) ---
+results/
+# keep placeholder if you want
+!results/README.md
+!results/.gitkeep
+
+# --- Paper assets (DO COMMIT) ---
+# (nothing to ignore here; figures and tables should live in paper/)
+cat >> .gitignore <<'GITIGNORE'
+
+# --- DO NOT COMMIT: data + run outputs ---
+data/processed/
+results/
+results_before_costfix_*/
+results_before_*/
+
+# --- DO COMMIT: final paper artifacts ---
+!paper_artifacts/
+!paper_artifacts/**
+GITIGNORE
