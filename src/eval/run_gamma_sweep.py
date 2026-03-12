@@ -35,22 +35,28 @@ class Row:
     t_stop: int
 
 
-def run_contextual_algo(
+def feasible_mask(costs: np.ndarray, remaining_budget: float) -> np.ndarray:
+    rem = float(remaining_budget)
+    return costs.astype(np.float64) <= (rem + 1e-12)
+
+
+def run_contextual_algo_costnorm_sub(
     env: SimBanditEnv,
     X_seq: np.ndarray,
-    algo,
+    algo: CostNormalizedDisjointUCB,
     budget_ratio: float,
     stop_at_budget: bool,
 ):
     """
-    Runner for contextual algorithms with:
-      - algo.select(x) -> a
-      - algo.update(a, x, r)
-    Delays via pending: dict[t_due] -> list[(a,x,r)]
-    Stop-at-budget implemented at action time using env.costs[a].
+    Correct runner for CostNormUCB[sub] with delayed feedback:
+      - apply pending reward updates
+      - choose a_t among feasible arms if stop_at_budget
+      - update_design immediately after committing action
+      - update_reward on feedback arrival (pending queue)
     """
     T = len(X_seq)
     B = float(budget_ratio) * T
+    costs = env.costs
 
     pending: dict[int, list[tuple[int, np.ndarray, float]]] = {}
     total_r = 0.0
@@ -58,29 +64,38 @@ def run_contextual_algo(
     t_stop = T
 
     for t in range(T):
-        # apply arrived rewards
-        if t in pending:
-            for (a_upd, x_upd, r_upd) in pending[t]:
-                algo.update_reward(a_upd, x_upd, r_upd)
+        for (a_upd, x_upd, r_upd) in pending.pop(t, []):
+            algo.update_reward(a_upd, x_upd, r_upd)
 
         x = X_seq[t]
-        a = int(algo.select(x))
-        c = float(env.costs[a])
 
-        if stop_at_budget and (total_c + c > B):
-            t_stop = t
-            break
+        if stop_at_budget:
+            feas = feasible_mask(costs, B - total_c)
+            if not bool(np.any(feas)):
+                t_stop = t
+                break
+            a = int(algo.select_feasible(x, feas))
+        else:
+            a = int(algo.select(x))
 
+        c = float(costs[a])
+
+        # commit design
+        algo.update_design(a, x)
+
+        # environment step
         r, _, dly = env.step(x, a)
+
         total_c += c
         total_r += float(r)
 
-        if dly >= 0:
-            t_due = t + int(dly)
+        dly = int(dly)
+        if dly <= 0:
+            algo.update_reward(a, x, float(r))
+        else:
+            t_due = t + dly
             if t_due < T:
                 pending.setdefault(t_due, []).append((a, x, float(r)))
-        else:
-            algo.update_reward(a, x, float(r))
 
     return total_r, total_c, t_stop
 
@@ -95,11 +110,17 @@ def run_pd_once(
     seed: int,
     stop_at_budget: bool,
 ):
+    """
+    PD-LinUCB baseline with the *same* semantics as run_compare_baselines:
+      - choose a_t among feasible arms if stop_at_budget
+      - dual update: b_t = (B - spent) / (T - t)
+      - update_design immediately, update_reward on feedback arrival
+    """
     env = SimBanditEnv.from_memmap_dir(memmap_dir, seed=seed, ridge_lambda=1.0, cost_mode="lin")
     X_seq = env.sample_contexts(T)
 
     B = float(budget_ratio) * T
-    bps = B / T
+    costs = env.costs
 
     algo = PrimalDualLinUCB(
         env.K, env.d,
@@ -107,38 +128,51 @@ def run_pd_once(
         alpha=float(alpha_pd),
         lam=float(lam),
         eta=float(eta_pd),
-        budget_per_step=float(bps),
         seed=seed + 777,
     )
 
-    # PD runner: selection returns (a,c) and updates dual inside
     pending: dict[int, list[tuple[int, np.ndarray, float]]] = {}
     total_r = 0.0
     total_c = 0.0
     t_stop = T
 
     for t in range(T):
-        if t in pending:
-            for (a_upd, x_upd, r_upd) in pending[t]:
-                algo.update_reward(a_upd, x_upd, r_upd)
+        for (a_upd, x_upd, r_upd) in pending.pop(t, []):
+            algo.update_reward(a_upd, x_upd, r_upd)
 
         x = X_seq[t]
-        a, c = algo.select_and_spend(x)
 
-        if stop_at_budget and (total_c + c > B):
-            t_stop = t
-            break
+        if stop_at_budget:
+            feas = feasible_mask(costs, B - total_c)
+            if not bool(np.any(feas)):
+                t_stop = t
+                break
+            a = int(algo.select_feasible(x, feas))
+        else:
+            a = int(algo.select(x))
+
+        c = float(costs[a])
+
+        # dual update BEFORE spending
+        H = T - t
+        b_t = (B - total_c) / max(H, 1)
+        algo.update_dual(c, b_t)
+
+        # commit design
+        algo.update_design(a, x)
 
         r, _, dly = env.step(x, a)
-        total_c += float(c)
+
+        total_c += c
         total_r += float(r)
 
-        if dly >= 0:
-            t_due = t + int(dly)
+        dly = int(dly)
+        if dly <= 0:
+            algo.update_reward(a, x, float(r))
+        else:
+            t_due = t + dly
             if t_due < T:
                 pending.setdefault(t_due, []).append((a, x, float(r)))
-        else:
-            algo.update_reward(a, x, float(r))
 
     spent_ratio = total_c / max(B, 1e-12)
     return total_r, total_c, spent_ratio, t_stop
@@ -146,6 +180,8 @@ def run_pd_once(
 
 def write_csv(path: Path, rows: list[dict]):
     path.parent.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        raise RuntimeError(f"Empty rows for {path}")
     with path.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         w.writeheader()
@@ -153,7 +189,6 @@ def write_csv(path: Path, rows: list[dict]):
 
 
 def summarize(rows: list[Row]):
-    # group by gamma
     gammas = sorted(set(r.gamma for r in rows))
     out = []
     for g in gammas:
@@ -190,8 +225,7 @@ def plot_with_ci(x, y, yerr, title, xlabel, ylabel, out_path: Path, xscale: str 
     plt.figure()
     plt.errorbar(x, y, yerr=yerr, marker="o", linewidth=1.5, capsize=3)
     if xscale:
-        # symlog allows gamma=0
-        plt.xscale(xscale, linthresh=0.1)
+        plt.xscale(xscale, linthresh=0.1)  # symlog allows gamma=0
     plt.grid(True, alpha=0.3)
     plt.title(title)
     plt.xlabel(xlabel)
@@ -216,7 +250,6 @@ def main():
     ap.add_argument("--alpha_cnu", type=float, default=1.0)
     ap.add_argument("--lam", type=float, default=1.0)
 
-    # optional: PD baseline line (recommended)
     ap.add_argument("--also_pd", action="store_true")
     ap.add_argument("--alpha_pd", type=float, default=1.5)
     ap.add_argument("--eta_pd", type=float, default=0.05)
@@ -230,7 +263,6 @@ def main():
     gammas = [float(s) for s in args.gammas.split(",") if s.strip() != ""]
     rows_raw: list[Row] = []
 
-    # --- run CNU[sub] across gammas and seeds ---
     for si in range(args.n_seeds):
         seed = int(args.seed0 + si)
 
@@ -250,7 +282,7 @@ def main():
                 seed=seed + 1000 + int(100 * g),
             )
 
-            total_r, total_c, t_stop = run_contextual_algo(
+            total_r, total_c, t_stop = run_contextual_algo_costnorm_sub(
                 env, X_seq, algo,
                 budget_ratio=args.budget_ratio,
                 stop_at_budget=bool(args.stop_at_budget),
@@ -261,17 +293,13 @@ def main():
 
         print(f"done seed {seed}")
 
-    # write raw
     raw_path = out_dir / "gamma_sweep_raw.csv"
-    raw_dicts = [r.__dict__ for r in rows_raw]
-    write_csv(raw_path, raw_dicts)
+    write_csv(raw_path, [r.__dict__ for r in rows_raw])
 
-    # summary
     summary = summarize(rows_raw)
     sum_path = out_dir / "gamma_sweep_summary.csv"
     write_csv(sum_path, summary)
 
-    # plots
     x = [d["gamma"] for d in summary]
     reward = [d["reward_mean"] for d in summary]
     reward_ci = [d["reward_ci95"] for d in summary]
@@ -296,7 +324,6 @@ def main():
         xscale="symlog",
     )
 
-    # optional: PD baseline as numbers (prints; if you want, we can overlay later)
     if args.also_pd:
         pd_rows = []
         for si in range(args.n_seeds):
@@ -307,9 +334,11 @@ def main():
                 seed, bool(args.stop_at_budget)
             )
             pd_rows.append((r, sratio, tstop))
+
         pd_r = np.array([x[0] for x in pd_rows], dtype=float)
         pd_s = np.array([x[1] for x in pd_rows], dtype=float)
         pd_t = np.array([x[2] for x in pd_rows], dtype=float)
+
         print("\nPD-LinUCB baseline (same T,rho):")
         print("reward mean=", pd_r.mean(), "std=", pd_r.std(ddof=1))
         print("spent/B mean=", pd_s.mean(), "std=", pd_s.std(ddof=1))

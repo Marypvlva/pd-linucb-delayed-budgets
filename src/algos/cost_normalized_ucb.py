@@ -1,4 +1,3 @@
-# src/algos/cost_normalized_ucb.py
 from __future__ import annotations
 import numpy as np
 
@@ -41,6 +40,10 @@ class CostNormalizedDisjointUCB:
         self.theta = np.zeros((self.K, self.d), dtype=np.float64)
 
     def select(self, x: np.ndarray) -> int:
+        feasible = np.ones(self.K, dtype=bool)
+        return self.select_feasible(x, feasible)
+
+    def select_feasible(self, x: np.ndarray, feasible: np.ndarray) -> int:
         x64 = x.astype(np.float64)
         mu = self.theta @ x64
         v = self.A_inv @ x64
@@ -53,6 +56,8 @@ class CostNormalizedDisjointUCB:
             score = ucb - self.gamma * self.costs
         else:
             raise ValueError("mode must be 'ratio' or 'sub'")
+
+        score = np.where(feasible, score, -np.inf)
         return int(np.argmax(score))
 
     def update_design(self, a: int, x: np.ndarray):
@@ -69,4 +74,3 @@ class CostNormalizedDisjointUCB:
         x64 = x.astype(np.float64)
         self.b[a] += float(r) * x64
         self.theta[a] = self.A_inv[a] @ self.b[a]
-

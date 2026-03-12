@@ -1,4 +1,3 @@
-# src/algos/linucb_pd_delayed.py
 from __future__ import annotations
 import numpy as np
 
@@ -23,11 +22,16 @@ class DisjointLinUCB:
         self.theta = np.zeros((self.K, self.d), dtype=np.float64)                    # (K,d)
 
     def select(self, x: np.ndarray) -> int:
+        feasible = np.ones(self.K, dtype=bool)
+        return self.select_feasible(x, feasible)
+
+    def select_feasible(self, x: np.ndarray, feasible: np.ndarray) -> int:
         x64 = x.astype(np.float64)
         mu = self.theta @ x64
         v = self.A_inv @ x64
         sigma = np.sqrt(np.sum(v * x64[None, :], axis=1))
         ucb = mu + self.alpha * sigma
+        ucb = np.where(feasible, ucb, -np.inf)
         return int(np.argmax(ucb))
 
     def update_design(self, a: int, x: np.ndarray):
@@ -38,8 +42,6 @@ class DisjointLinUCB:
         v = Ainv @ x64
         denom = 1.0 + float(x64 @ v)
         self.A_inv[a] = Ainv - np.outer(v, v) / denom
-
-        # theta changes only through A_inv; keep consistent with current b
         self.theta[a] = self.A_inv[a] @ self.b[a]
 
     def update_reward(self, a: int, x: np.ndarray, r: float):
@@ -82,12 +84,17 @@ class PrimalDualLinUCB:
         self.theta = np.zeros((self.K, self.d), dtype=np.float64)
 
     def select(self, x: np.ndarray) -> int:
+        feasible = np.ones(self.K, dtype=bool)
+        return self.select_feasible(x, feasible)
+
+    def select_feasible(self, x: np.ndarray, feasible: np.ndarray) -> int:
         x64 = x.astype(np.float64)
         mu = self.theta @ x64
         v = self.A_inv @ x64
         sigma = np.sqrt(np.sum(v * x64[None, :], axis=1))
         ucb = mu + self.alpha * sigma
         score = ucb - self.dual * self.costs
+        score = np.where(feasible, score, -np.inf)
         return int(np.argmax(score))
 
     def update_dual(self, cost: float, b_t: float):

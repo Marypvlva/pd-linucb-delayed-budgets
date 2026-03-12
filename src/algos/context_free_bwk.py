@@ -1,4 +1,3 @@
-# src/algos/context_free_bwk.py
 from __future__ import annotations
 import numpy as np
 
@@ -31,10 +30,15 @@ class ContextFreePrimalDualBwK:
         self.sum_r = np.zeros(self.K, dtype=np.float64)
 
     def select(self, t: int) -> int:
+        feasible = np.ones(self.K, dtype=bool)
+        return self.select_feasible(t, feasible)
+
+    def select_feasible(self, t: int, feasible: np.ndarray) -> int:
         tt = float(t + 1)
         mu = self.sum_r / np.maximum(self.n, 1)
         bonus = self.alpha * np.sqrt(np.log(tt + 1.0) / np.maximum(self.n, 1))
         score = (mu + bonus) - self.dual * self.costs
+        score = np.where(feasible, score, -np.inf)
         return int(np.argmax(score))
 
     def update_dual(self, cost: float, b_t: float):

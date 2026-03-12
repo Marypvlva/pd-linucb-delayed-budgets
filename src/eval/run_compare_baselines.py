@@ -11,7 +11,6 @@ if str(_REPO_ROOT) not in sys.path:
 
 import argparse
 import csv
-
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -32,6 +31,12 @@ def append_csv(path: str, row: dict):
         w.writerow(row)
 
 
+def _feasible_mask(costs: np.ndarray, remaining_budget: float) -> np.ndarray:
+    # small epsilon to avoid numerical issues
+    rem = float(remaining_budget)
+    return costs.astype(np.float64) <= (rem + 1e-12)
+
+
 def run_contextual_algo(
     env: SimBanditEnv,
     X_seq: np.ndarray,
@@ -41,13 +46,16 @@ def run_contextual_algo(
     is_primal_dual: bool,
 ):
     """
-    Contextual runner with:
-      - OTF design update: update_design() right after action is committed
-      - reward-only delayed updates: update_reward() on feedback arrival
-      - primal-dual uses dynamic b_t computed from remaining budget
+    Contextual runner:
+      - pending queue applies reward updates on arrival
+      - stop-at-budget with feasible-set selection:
+          choose argmax score over {a: c(a) <= remaining_budget}
+          stop only if feasible set is empty
+      - primal-dual uses b_t computed from remaining budget and remaining horizon
     """
     T = len(X_seq)
     B = float(budget_ratio) * T
+    costs = env.costs  # (K,)
 
     pending: dict[int, list[tuple[int, np.ndarray, float]]] = {}
     cum_r = np.zeros(T, dtype=np.float64)
@@ -63,15 +71,21 @@ def run_contextual_algo(
             algo.update_reward(a_upd, x_upd, r_upd)
 
         x = X_seq[t]
-        a = algo.select(x)
-        c = float(env.costs[a])
 
-        # stop-at-budget check BEFORE any side effects
-        if stop_at_budget and (total_c + c > B):
-            t_stop = t
-            cum_r[t:] = total_r
-            cum_c[t:] = total_c
-            break
+        # ---- stop-at-budget with feasible-set selection ----
+        if stop_at_budget:
+            feasible = _feasible_mask(costs, B - total_c)
+            if not bool(np.any(feasible)):
+                t_stop = t
+                cum_r[t:] = total_r
+                cum_c[t:] = total_c
+                break
+            a = algo.select_feasible(x, feasible)
+        else:
+            a = algo.select(x)
+
+        a = int(a)
+        c = float(costs[a])
 
         # commit action: primal-dual dual update + design update
         if is_primal_dual:
@@ -85,18 +99,18 @@ def run_contextual_algo(
         r, _, dly = env.step(x, a)
 
         total_c += c
-        total_r += r
+        total_r += float(r)
         cum_r[t] = total_r
         cum_c[t] = total_c
 
         # schedule reward update
         dly = int(dly)
         if dly <= 0:
-            algo.update_reward(a, x, r)
+            algo.update_reward(a, x, float(r))
         else:
             t_due = t + dly
             if t_due < T:
-                pending.setdefault(t_due, []).append((a, x, r))
+                pending.setdefault(t_due, []).append((a, x, float(r)))
             # else: feedback arrives after horizon -> not observed in this run
 
     return {
@@ -110,18 +124,22 @@ def run_contextual_algo(
 
 def run_context_free_pd(
     env: SimBanditEnv,
-    X_seq: np.ndarray,
+    X_seq: np.ndarray,  # kept for interface symmetry; not used by context-free algo
     algo: ContextFreePrimalDualBwK,
     budget_ratio: float,
     stop_at_budget: bool,
 ):
     """
     Context-free runner:
-      - delayed reward updates via pending
-      - dynamic b_t from remaining budget
+      - pending queue applies reward updates on arrival
+      - stop-at-budget with feasible-set selection:
+          choose argmax score over {a: c(a) <= remaining_budget}
+          stop only if feasible set is empty
+      - primal-dual uses b_t computed from remaining budget and remaining horizon
     """
     T = len(X_seq)
     B = float(budget_ratio) * T
+    costs = env.costs  # (K,)
 
     pending: dict[int, list[tuple[int, float]]] = {}
     cum_r = np.zeros(T, dtype=np.float64)
@@ -133,37 +151,42 @@ def run_context_free_pd(
 
     for t in range(T):
         for (a_upd, r_upd) in pending.pop(t, []):
-            algo.update(a_upd, r_upd)
+            algo.update(int(a_upd), float(r_upd))
 
-        a = algo.select(t)
-        c = float(env.costs[a])
+        # ---- stop-at-budget with feasible-set selection ----
+        if stop_at_budget:
+            feasible = _feasible_mask(costs, B - total_c)
+            if not bool(np.any(feasible)):
+                t_stop = t
+                cum_r[t:] = total_r
+                cum_c[t:] = total_c
+                break
+            a = algo.select_feasible(t, feasible)
+        else:
+            a = algo.select(t)
 
-        if stop_at_budget and (total_c + c > B):
-            t_stop = t
-            cum_r[t:] = total_r
-            cum_c[t:] = total_c
-            break
+        a = int(a)
+        c = float(costs[a])
 
         # dual update with remaining-budget target
         H = T - t
         b_t = (B - total_c) / max(H, 1)
         algo.update_dual(c, b_t)
 
-        x = X_seq[t]
-        r, _, dly = env.step(x, a)
+        r, _, dly = env.step(X_seq[t], a)  # env reward model still uses x_t
 
         total_c += c
-        total_r += r
+        total_r += float(r)
         cum_r[t] = total_r
         cum_c[t] = total_c
 
         dly = int(dly)
         if dly <= 0:
-            algo.update(a, r)
+            algo.update(a, float(r))
         else:
             t_due = t + dly
             if t_due < T:
-                pending.setdefault(t_due, []).append((a, r))
+                pending.setdefault(t_due, []).append((a, float(r)))
 
     return {
         "cum_r": cum_r,
@@ -213,7 +236,6 @@ def main():
         raise RuntimeError("Use --memmap_dir for this pipeline (real costs/delays).")
 
     X_seq = env.sample_contexts(args.T)
-
     B = float(args.budget_ratio) * float(args.T)
 
     # instantiate methods
@@ -310,10 +332,6 @@ def main():
     outdir.mkdir(parents=True, exist_ok=True)
 
     def save_base_and_tag(basename: str, dpi: int = 200):
-        """
-        Always save basename.png.
-        If --tag provided, also save basename_{tag}.png (so article can reference a fixed tag name).
-        """
         plt.savefig(outdir / f"{basename}.png", dpi=dpi)
         if args.tag:
             plt.savefig(outdir / f"{basename}_{args.tag}.png", dpi=dpi)
@@ -391,7 +409,6 @@ def main():
     plt.ylabel(r"$\bar c_t = \mathrm{spent}_t / t$")
     plt.legend(ncol=2)
     plt.tight_layout()
-    # base: avg_cost_per_step.png; tagged: avg_cost_per_step_rho0.7.png (if --tag rho0.7)
     save_base_and_tag("avg_cost_per_step", dpi=220)
     plt.close()
 
