@@ -6,10 +6,10 @@ from pathlib import Path
 RAW = Path("data/raw/obd")
 OUT = Path("data/processed/obd_feedback.npz")
 
-# У тебя папки именно так: data/raw/obd/bts/all/all.csv и item_context.csv рядом
-BEHAVIOR_POLICY = "bts"   # "bts" или "random"
+# Expected folder layout: data/raw/obd/bts/all/all.csv with item_context.csv alongside it.
+BEHAVIOR_POLICY = "bts"   # "bts" or "random"
 CAMPAIGN = "all"          # "all" / "men" / "women"
-MAX_ROWS = None           # например 200000 для быстрого прогона
+MAX_ROWS = None           # e.g. 200000 for a quick dry run
 
 
 def parse_vector_cell(s: str) -> np.ndarray:
@@ -107,7 +107,7 @@ def main():
     if "item_id" in item.columns and item_feat_cols and "item_id" in df.columns:
         item_small = item[["item_id"] + item_feat_cols].copy()
         df_item = df[["item_id"]].merge(item_small, on="item_id", how="left")
-        # item_feature_* тоже могут быть строками => factorize/numeric
+        # item_feature_* columns may also be strings, so factorize if needed.
         I = to_float_matrix(df_item, item_feat_cols)
         print("Loaded item features:", I.shape[1])
 

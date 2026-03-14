@@ -58,7 +58,7 @@ def main():
         ab = ab[keep]
         rb = rb[keep]
 
-        # обновляем по каждому arm, который встретился в чанке
+        # Update each arm that appears in the current chunk.
         for a in np.unique(ab):
             mask = (ab == a)
             if not mask.any():
@@ -75,7 +75,7 @@ def main():
 
     out_path = ddir / args.out
 
-    # сразу считаем theta_a (ridge) чтобы симулятору было проще
+    # Compute ridge estimates theta_a up front to simplify the simulator.
     I = np.eye(d, dtype=np.float64)
     Theta = np.zeros((K, d), dtype=np.float64)
     for a in range(K):

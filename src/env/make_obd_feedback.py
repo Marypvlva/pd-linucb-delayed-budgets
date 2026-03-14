@@ -7,28 +7,28 @@ OUT_PATH = Path("data/processed/obd_feedback.npz")
 
 
 def main():
-    # 1) Загружаем Open Bandit Dataset (OBD) через OBP
-    # Часто работают такие параметры:
+    # 1) Load the Open Bandit Dataset (OBD) via OBP.
+    # These parameters are commonly available:
     dataset = OpenBanditDataset(behavior_policy="random", campaign="all")
 
     bandit_feedback = dataset.obtain_batch_bandit_feedback()
 
-    # 2) Достаём массивы
+    # 2) Extract arrays.
     X = bandit_feedback["context"].astype(np.float32)          # (n, d)
     A = bandit_feedback["action"].astype(np.int64)             # (n,)
     R = bandit_feedback["reward"].astype(np.float32)           # (n,)
 
-    # pscore полезен для off-policy, но не обязателен сейчас
+    # pscore is useful for off-policy evaluation, but optional here.
     pscore = bandit_feedback.get("pscore", None)
     if pscore is not None:
         pscore = np.asarray(pscore, dtype=np.float32)
 
     n = X.shape[0]
 
-    # 3) Стоимость (пока MVP): один ресурс, cost=1 за любой шаг
+    # 3) Cost model for the MVP: one resource, cost=1 for every round.
     C = np.ones((n, 1), dtype=np.float32)
 
-    # 4) Задержки (пока нет): -1 означает "мгновенно/не используем delays"
+    # 4) No delays for now: -1 means "instant / delays unused".
     D = -np.ones(n, dtype=np.int64)
 
     OUT_PATH.parent.mkdir(parents=True, exist_ok=True)

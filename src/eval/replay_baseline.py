@@ -13,7 +13,7 @@ def main():
 
     T = len(R)
 
-    # бюджет: например 30% от горизонта при cost=1
+    # Example budget: 30% of the horizon when cost=1.
     B = 0.3 * T
 
     cum_r = np.cumsum(R)

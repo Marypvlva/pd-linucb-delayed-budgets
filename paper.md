@@ -5,16 +5,16 @@
 \usepackage[utf8]{inputenc}
 \usepackage[T2A]{fontenc}
 \usepackage[russian,english]{babel}
-% --- tables with SI-style numbers (optional but удобнее) ---
+% --- tables with SI-style numbers (optional but more convenient) ---
 \usepackage{siunitx}
 \sisetup{detect-all}
-\usepackage{subcaption} % для subfigure
+\usepackage{subcaption} % for subfigure
 \usepackage{float}
 \usepackage{amsmath,amssymb,amsthm}
 
 \theoremstyle{plain}
-\newtheorem{proposition}{Утверждение} % или [section], если хочешь по секциям
-\renewcommand{\proofname}{Доказательство} % чтобы не было "Proof."
+\newtheorem{proposition}{Утверждение} % or use [section] to number by section
+\renewcommand{\proofname}{Доказательство} % avoid the default "Proof." label
 \DeclareMathOperator{\clip}{clip}
 \usepackage{mathtools}
 \usepackage{graphicx}
