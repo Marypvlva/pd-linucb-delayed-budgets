@@ -1,15 +1,5 @@
-\begin{table}[t]
-\centering
-\caption{Результаты (mean $\pm$ 95\% CI по $N$ сидам), $T=8000$, $B/T=0.7$, stop-at-budget.}
-\label{tab:main_ci}
-\begin{tabular}{lccc}
-\toprule
-Метод & Total reward & spent$/B$ & $t_{\text{stop}}$ \\
-\midrule
-LinUCB & 297.3 $\pm$ 16.3 & 1.000 $\pm$ 0.000 & 5601.6 $\pm$ 9.6 \\
-PD-LinUCB & 410.1 $\pm$ 13.1 & 1.000 $\pm$ 0.000 & 7999.2 $\pm$ 0.6 \\
-CostNormUCB[ratio] & 350.8 $\pm$ 9.7 & 1.000 $\pm$ 0.000 & 6501.0 $\pm$ 15.8 \\
-CF-PD-BwK & 372.1 $\pm$ 10.4 & 1.000 $\pm$ 0.000 & 7997.3 $\pm$ 5.4 \\
-\bottomrule
-\end{tabular}
-\end{table}
+% This file is generated/overwritten by:
+%   python -m src.eval.run_compare_baselines --memmap_dir ... --T 5000 --budget_ratio 0.7 --stop_at_budget --n_seeds 10
+%
+% Tabular-only indirection:
+\input{paper_artifacts/tables/main_ci.tex}

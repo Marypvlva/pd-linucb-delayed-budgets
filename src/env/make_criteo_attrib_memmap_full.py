@@ -45,7 +45,15 @@ def main():
 
     # IMPORTANT: delays are stored in "steps", computed from timestamps using delta_seconds
     ap.add_argument("--delta_seconds", type=int, default=3600, help="time discretization step (e.g. 3600=1h)")
-    ap.add_argument("--censor_seconds", type=int, default=30 * 24 * 3600, help="censoring window W in seconds")
+    ap.add_argument(
+        "--censor_seconds",
+        type=int,
+        default=5000 * 3600,
+        help=(
+            "censoring window W in seconds (default matches paper: W/Δ=5000 at Δ=3600). "
+            "Set 30*24*3600 for a 30-day window."
+        ),
+    )
     # keep backward compatibility with your old flag name:
     ap.add_argument("--d_max", "--max_delay", dest="d_max", type=int, default=5000,
                     help="max delay in STEPS (used for clipping and as censor delay)")
