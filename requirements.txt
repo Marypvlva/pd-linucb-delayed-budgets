@@ -1,0 +1,11 @@
+# Core dependencies for the Criteo delayed-budget pipeline.
+# Supports:
+# - dataset download
+# - memmap preprocessing
+# - simulator loading
+# - all main evaluation / plotting scripts
+
+numpy>=1.24,<3
+pandas>=2.0,<3
+matplotlib>=3.7,<4
+scipy>=1.10,<2

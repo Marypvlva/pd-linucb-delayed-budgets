@@ -1,0 +1,4 @@
+# Optional dependency for the Open Bandit Dataset helper only.
+# Install this only if you use src/env/make_obd_feedback.py.
+
+obp>=0.5,<1

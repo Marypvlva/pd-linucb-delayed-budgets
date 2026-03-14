@@ -41,7 +41,41 @@ python -m pip install -U pip wheel
 python -m pip install -r requirements.txt
 ```
 
-## 1) Build a train/test memmap artifact
+Optional, only if you use the Open Bandit Dataset helper in `src/env/make_obd_feedback.py`:
+
+```bash
+python -m pip install -r requirements-obd.txt
+```
+
+## 1) Download the official Criteo Attribution dataset
+
+Official source page:
+
+- `https://ailab.criteo.com/criteo-attribution-modeling-bidding-dataset/`
+
+Direct archive used by the helper:
+
+- `https://go.criteo.net/criteo-research-attribution-dataset.zip`
+
+The public dataset page states the archive is released under `CC BY-NC-SA 4.0`. Review the terms on the official page before downloading.
+
+Automatic download into `data/raw/criteo_attrib/`:
+
+```bash
+python -m src.env.download_criteo_attribution_dataset \
+  --out_dir data/raw/criteo_attrib \
+  --accept_criteo_nc_sa_license
+```
+
+This extracts at least:
+
+- `data/raw/criteo_attrib/criteo_attribution_dataset.tsv.gz`
+- `data/raw/criteo_attrib/README.md`
+- `data/raw/criteo_attrib/Experiments.ipynb`
+
+If the automatic download fails because the upstream URL changes, open the official source page above and download the archive manually into `data/raw/criteo_attrib/`.
+
+## 2) Build a train/test memmap artifact
 
 For a leakage-clean split, fit the simulator on train rows and evaluate on test contexts. The command below creates one artifact with:
 
@@ -71,7 +105,7 @@ python -m src.env.compute_arm_ridge_stats_from_memmap \
   --lam 1.0 --out arm_ridge_stats.npz
 ```
 
-## 2) Run the full experiment suite on test contexts
+## 3) Run the full experiment suite on test contexts
 
 All evaluation scripts support `--context_split auto`, which means:
 
@@ -162,7 +196,7 @@ Outputs:
 - `paper_artifacts/figures/budget_sweep_gamma_star.png`
 - `paper_artifacts/figures/budget_sweep_spent.png`
 
-## 3) One-command evaluation runner
+## 4) One-command evaluation runner
 
 After preprocessing, you can run the full suite with:
 
