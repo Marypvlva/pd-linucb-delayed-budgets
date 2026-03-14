@@ -15,8 +15,6 @@
 \theoremstyle{plain}
 \newtheorem{proposition}{Утверждение} % или [section], если хочешь по секциям
 \renewcommand{\proofname}{Доказательство} % чтобы не было "Proof."
-% ...
-\usepackage{amsmath,amssymb,amsthm}
 \DeclareMathOperator{\clip}{clip}
 \usepackage{mathtools}
 \usepackage{graphicx}
@@ -26,9 +24,10 @@
 \usepackage{enumitem}
 
 \geometry{margin=2.2cm}
+\newcommand{\inputifexists}[1]{\IfFileExists{#1}{\input{#1}}{\textbf{[Missing artifact: #1]}}}
 
 \title{Contextual bandits with a budget constraint and delayed feedback:\\
-primal--dual LinUCB and large-scale empirical data on Criteo Attribution}
+primal--dual LinUCB and a large-scale semi-synthetic benchmark on Criteo Attribution}
 \author{Мария Павлова}
 \date{}
 
@@ -36,12 +35,12 @@ primal--dual LinUCB and large-scale empirical data on Criteo Attribution}
 \maketitle
 
 \begin{abstract}
-We study a stochastic online optimization problem in which an agent sequentially selects an action based on an observed context, receives a random reward, and incurs a cost under a global budget constraint. Unlike in classical contextual bandits, reward feedback may be delayed, which complicates both learning and budget control. We propose and investigate a primal--dual variant of Disjoint LinUCB in which the budget constraint is handled through an adaptive dual variable, interpreted as the resource's shadow price, while model updates are performed as delayed feedback arrives. To ensure reproducibility, we build a scalable experimental prototype on the full Criteo Attribution dataset, using memmap-based storage for features and events together with a stop-at-budget protocol that guarantees zero budget violations.
+We study a stochastic online optimization problem in which an agent sequentially selects an action based on an observed context, receives a random reward, and incurs a cost under a global budget constraint. Unlike in classical contextual bandits, reward feedback may be delayed, which complicates both learning and budget control. We propose and investigate a primal--dual variant of Disjoint LinUCB in which the budget constraint is handled through an adaptive dual variable, interpreted as the resource's shadow price, while model updates are performed as delayed feedback arrives. To ensure reproducibility, we build a scalable semi-synthetic benchmark on the full Criteo Attribution dataset, using memmap-based storage together with a stop-at-budget protocol that guarantees zero budget violations.
 
 In experiments on an arm-specific contextual environment, we use a linear conditional mean model
 $\mu_a(x)=\clip(\theta_a^\top x,0,1)$ and generate rewards according to
 $r\sim\mathrm{Bernoulli}(\mu_a(x))$,
-with arm-specific parameters $\theta_a$ estimated by ridge regression on the full dataset. We also compare our method against a fixed Lagrangian-penalty baseline of the form $\mathrm{UCB}-\gamma c$ and show that its performance is highly sensitive to both the choice of $\gamma$ and the budget regime. In particular, the optimal $\gamma^\star$ changes with the ratio $B/T$ and may lead to budget underutilization, as confirmed by a Pareto analysis of ``reward vs.\ spent$/B$''. Overall, the results show that the adaptive primal--dual mechanism provides a robust alternative to simple cost-aware heuristics.
+with arm-specific parameters $\theta_a$ estimated by ridge regression on the temporal training split. We also compare our method against a fixed Lagrangian-penalty baseline of the form $\mathrm{UCB}-\gamma c$ and show that its performance is highly sensitive to both the choice of $\gamma$ and the budget regime. In particular, the optimal $\gamma^\star$ changes with the ratio $B/T$, which motivates nested tuning on a separate split/seed set before held-out evaluation. Overall, the results show that the adaptive primal--dual mechanism provides a robust alternative to simple cost-aware heuristics.
 \end{abstract}
 
 
@@ -78,12 +77,12 @@ Under delayed feedback, we use a \emph{design-now, reward-later} update scheme: 
   \item \textbf{PD-LinUCB algorithm for delayed feedback:} a primal--dual variant of Disjoint LinUCB with a dynamic spending target
   $b_t=(B-\mathrm{spent}_{t-1})/(T-t+1)$ and delayed updates implemented via the \emph{design-now, reward-later} scheme.
 
-  \item \textbf{Realistic simulator based on Criteo:} a reproducible online environment built on the full
-  Criteo Attribution dataset (16.47M events) stored in \texttt{memmap} format, where costs are taken from the \texttt{cost} field
-  and delays are computed from \texttt{conversion\_timestamp}-\texttt{timestamp} with discretization and observation-window censoring.
+  \item \textbf{Semi-synthetic benchmark based on Criteo:} a reproducible online environment built on the full
+  Criteo Attribution dataset (16.47M events) stored in \texttt{memmap} format, with a temporal train/test split, arm-level costs from the \texttt{cost} field,
+  and delays computed from \texttt{conversion\_timestamp}-\texttt{timestamp} with discretization and observation-window censoring.
 
   \item \textbf{Systematic empirical evaluation:} comparison of PD-LinUCB with LinUCB, cost-aware heuristics, and a context-independent PD-BwK baseline,
-  including a sensitivity analysis of the fixed penalty $\gamma$ in $\mathrm{UCB}-\gamma c$ across different budget regimes,
+  including held-out simulator diagnostics, a sensitivity analysis of the fixed penalty $\gamma$ in $\mathrm{UCB}-\gamma c$ across different budget regimes,
   and reporting $95\%$ confidence intervals over multiple seeds (reward, spent$/B$, stopping time).
 \end{itemize}
 
@@ -153,11 +152,13 @@ r_t \sim \mathrm{Bernoulli}\big(\mu_{a_t}(x_t)\big).
 \label{eq:bern_linear}
 \end{equation}
 
-The parameters $\theta_a$ are calibrated on the logged data via ridge regression:
+The parameters $\theta_a$ are calibrated on the logged training split via ridge regression:
 \begin{equation}
 \widehat{\theta}_a=\arg\min_{\theta}\sum_{i:A_i=a}(R_i-\theta^\top X_i)^2+\lambda\|\theta\|_2^2.
 \label{eq:ridge}
 \end{equation}
+
+The main benchmark uses this clipped-linear simulator. In addition, we fit an optional arm-wise logistic simulator on the same training split and report held-out calibration diagnostics for it.
 
 
 
@@ -267,6 +268,8 @@ including the case $D_t=0$, where the update occurs in the same round.
 Conceptually, this corresponds to the fact that exposures (pairs $(a_t,x_t)$) are recorded immediately, while the corresponding labels $r_t$ arrive later.
 
 Note that under delayed feedback the uncertainty radius is computed using the current geometry of contexts before the corresponding rewards are observed. We treat this as a practical engineering heuristic that works well in large-scale empirical settings; a rigorous theoretical treatment of delayed confidence radii is beyond the scope of this work \cite{joulani2013online,hoeven2023unified}.
+
+Under this linear ridge update, a confirmed zero label contributes $x\cdot 0$ to the response vector and therefore does not change the model at arrival time once the design update has already been committed. Accordingly, in the default linear benchmark the delayed learning dynamics are driven mainly by positive outcomes; the optional logistic simulator and logistic policy family are included as a more statistically faithful alternative that updates on both positive and negative labels.
 \paragraph{Numerical efficiency.}
 For computational efficiency, the inverse matrix $A_{a,t}^{-1}$ is maintained explicitly, and the Sherman--Morrison rank-one update is applied when adding the outer product $x_tx_t^\top$:
 \begin{equation}
@@ -337,7 +340,7 @@ a_t=\arg\max_{a\in\mathcal{A}}
 \big(\mathrm{UCB}_t(x_t,a)-\gamma\,c(a)\big),
 \]
 where $\gamma\ge 0$ is a fixed multiplier (a static Lagrangian penalty) that must be tuned.
-In the experiments, we perform a sweep over $\gamma$ and analyze the resulting Pareto frontier in terms of ``reward vs.\ spent$/B$''.
+In the experiments, we perform a sweep over $\gamma$ and report how both total reward and budget utilization vary with this fixed penalty.
 
 Both heuristics use the same \emph{design-now, reward-later} delayed-update scheme for $(A_a,b_a)$ and are evaluated under the same stop-at-budget protocol.
 
@@ -442,7 +445,28 @@ The conversion probability is generated according to an arm-specific linear cond
 \[
 \mu_a(x)=\clip(\theta_a^\top x,0,1),\qquad r\sim\mathrm{Bernoulli}(\mu_a(x)),
 \]
-where the parameters $\theta_a$ are calibrated using ridge regression on the logged data for each arm (Section~\ref{sec:problem}). This design yields a controlled experimental environment that preserves realistic distributions of contexts, costs, and delays while ensuring reproducible reward generation.
+where the parameters $\theta_a$ are calibrated using ridge regression on the training split for each arm (Section~\ref{sec:problem}). This design yields a controlled semi-synthetic environment that preserves realistic distributions of contexts, costs, and delays while ensuring reproducible reward generation. We additionally fit an arm-wise logistic simulator on the same training split and evaluate its held-out calibration, but the main policy comparisons in this paper use the default clipped-linear simulator unless noted otherwise.
+
+\subsection{Held-Out Simulator Diagnostics}
+\label{subsec:diagnostics}
+
+To assess how well the fitted simulator matches held-out rows, we report calibration and split-stability diagnostics on the test split. The diagnostics include Brier score and log loss for the reward model, the train-vs-test CDF of positive delays, and arm-level train-vs-test comparisons for average delay and normalized arm cost.
+
+\begin{table}[t]
+\centering
+\caption{Held-out simulator diagnostics on the temporal test split. Lower Brier/log loss are better.}
+\label{tab:simulator_diagnostics}
+\inputifexists{paper_artifacts/tables/simulator_diagnostics.tex}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\IfFileExists{paper_artifacts/figures/simulator_calibration.png}
+  {\includegraphics[width=0.72\linewidth]{paper_artifacts/figures/simulator_calibration.png}}
+  {\fbox{\parbox{0.72\linewidth}{Missing artifact: paper\_artifacts/figures/simulator\_calibration.png}}}
+\caption{Held-out calibration of the simulator on test rows. Quantile bins are used to avoid sparse-bin artifacts in the rare-event tail.}
+\label{fig:simulator_calibration}
+\end{figure}
 
 \subsection{Experiment Protocol and Metrics}
 \label{subsec:protocol}
@@ -463,7 +487,6 @@ The following evaluation metrics are reported:
 \begin{itemize}[leftmargin=1.2em]
 \item \textbf{Total reward:} $R=\sum_{t=1}^{\tau} r_t$;
 \item \textbf{Budget utilization:} $\mathrm{spent}/B$;
-\item \textbf{Efficiency:} $R/\mathrm{spent}$;
 \item \textbf{Stopping time:} $\tau$ (number of executed actions).
 \end{itemize}
 
@@ -484,16 +507,7 @@ Table~\ref{tab:main_ci_T5000} reports results for $T=5000$ and $\rho=0.7$ under 
 \centering
 \caption{Results for $T=5000$ and $\rho=0.7$ (stop-at-budget). Mean values over $N=10$ seeds with $95\%$ confidence intervals.}
 \label{tab:main_ci_T5000}
-\begin{tabular}{lrrrrrr}
-\toprule
-Method & Reward (mean) & 95\% CI & Spent$/B$ (mean) & 95\% CI & $\tau$ (mean) & 95\% CI \\
-\midrule
-LinUCB             & 192.5 & 9.5  & 0.999780 & 0.000082 & 3650.6 & 10.1 \\
-PD-LinUCB          & 255.8 & 12.8 & 0.999825 & 0.000092 & 4999.6 & 0.6  \\
-CostNormUCB[ratio] & 223.0 & 11.7 & 0.999889 & 0.000068 & 4261.6 & 9.0  \\
-CF-PD-BwK          & 225.6 & 10.3 & 0.999561 & 0.000411 & 4998.1 & 2.1  \\
-\bottomrule
-\end{tabular}
+\inputifexists{paper_artifacts/tables/main_ci.tex}
 \end{table}
 
 \begin{figure}[t]
@@ -509,12 +523,11 @@ CF-PD-BwK          & 225.6 & 10.3 & 0.999561 & 0.000411 & 4998.1 & 2.1  \\
 \caption{Cumulative cost and budget $B$ (example run).}
 \label{fig:cum_cost}
 \end{figure}
-\subsection{Gamma Sweep for CostNormUCB[sub] and Pareto Analysis}
+\subsection{Gamma Sweep for CostNormUCB[sub]}
 \label{subsec:gamma_sweep}
 
 For the $\mathrm{UCB}-\gamma c$ heuristic, we perform a sweep over $\gamma$ with fixed $T$ and $\rho$. In the updated evaluation protocol, $\gamma$ is selected by \emph{nested tuning}: we tune on a separate split/seed set and report the selected $\gamma^\star$ only on held-out evaluation seeds.
-Since a fixed penalty may cause the method to underutilize the available budget, the comparison is conducted in the coordinate space
-(total reward, $\mathrm{spent}/B$) and is complemented by a Pareto analysis of ``reward vs.\ $\mathrm{spent}/B$''.
+Since a fixed penalty may cause the method to underutilize the available budget, we report both total reward and budget utilization across the $\gamma$ sweep.
 
 \begin{figure}[t]
 \centering
@@ -550,13 +563,43 @@ The \texttt{no-delay} ablation is implemented by forcing all delays to zero:
 $censor\_steps=0$ and $\texttt{delays\_pos}=\{0\}$, so the environment always returns $D_t\equiv 0$
 for both $r=1$ and $r=0$.
 
+\begin{table}[t]
+\centering
+\caption{Delay ablation: empirical delays with censoring versus \texttt{no-delay} ($D_t\equiv 0$).}
+\label{tab:delay_ablation}
+\inputifexists{paper_artifacts/tables/delay_ablation.tex}
+\end{table}
+
 \subsection{Budget Sweep $\rho=B/T$}
 \label{subsec:budget_sweep}
 
 The key experiment performs a sweep over the budget ratio $\rho$ for a fixed horizon $T$.
 We compare PD-LinUCB with CostNormUCB[sub] (using the best $\gamma$ selected by nested tuning) and show that
 the optimal penalty $\gamma^\star$ depends strongly on $\rho$, whereas PD-LinUCB adapts automatically through its dynamic multiplier.
-For each $\rho$, we additionally plot the ``reward vs.\ $\mathrm{spent}/B$'' trade-off.
+The tuning step uses a disjoint set of seeds and, when a temporal split is available, tunes on training contexts and evaluates on test contexts.
+
+\begin{table}[t]
+\centering
+\caption{Budget sweep over $\rho=B/T$: PD-LinUCB versus the tuned CostNormUCB[sub] baseline selected by nested tuning.}
+\label{tab:budget_sweep}
+\inputifexists{paper_artifacts/tables/budget_sweep.tex}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\begin{subfigure}[t]{0.49\linewidth}
+  \centering
+  \includegraphics[width=\linewidth,height=0.28\textheight,keepaspectratio]{paper_artifacts/figures/budget_sweep_reward.png}
+  \caption{Held-out reward versus $\rho$.}
+\end{subfigure}\hfill
+\begin{subfigure}[t]{0.49\linewidth}
+  \centering
+  \includegraphics[width=\linewidth,height=0.28\textheight,keepaspectratio]{paper_artifacts/figures/budget_sweep_gamma_star.png}
+  \caption{Selected $\gamma^\star(\rho)$ from nested tuning.}
+\end{subfigure}
+\caption{Budget sweep with nested tuning: the tuned fixed-penalty baseline remains regime-dependent, while PD-LinUCB does not require manual retuning across budget levels.}
+\label{fig:budget_sweep}
+\end{figure}
 
 \subsection{Reproducibility: Hyperparameters and Settings}
 \label{subsec:hyperparams}
@@ -571,15 +614,17 @@ Parameter & Value \\
 \midrule
 Number of arms $K$ & $50$ \\
 Context dimension $d$ & $65$ ($64$ hashed categorical + $1$ numerical feature) \\
-Horizon $T$ & $5000$ (and $20000$ in ablation experiments) \\
+Horizon $T$ & $5000$ \\
 Budget ratio $\rho=B/T$ & $\{0.40, 0.55, 0.70, 0.85\}$ \\
 Regularization $\lambda$ (ridge) & $1.0$ \\
 LinUCB $\alpha_{\text{lin}}$ & $1.0$ \\
 PD-LinUCB $\alpha_{\text{pd}}$ & $1.5$ \\
 PD-LinUCB step $\eta$ & $0.05$ \\
 CostNormUCB[ratio] $\varepsilon$ & $10^{-3}$ \\
-CostNormUCB[sub] $\gamma$ & sweep (e.g., $\{0.1,0.3,1,2,3,5\}$) \\
-Seeds & $123+s$, $s\in\{1,\dots,N\}$ (e.g., $N=10$) \\
+CostNormUCB[sub] $\gamma$ & sweep (e.g., $\{0,0.1,0.3,1,2,3,5,10\}$) \\
+Evaluation seeds & $123+s$, $s\in\{1,\dots,N\}$ (e.g., $N=10$) \\
+Tuning seeds for $\gamma^\star$ & $10123+s$, $s\in\{1,\dots,N_{\mathrm{tune}}\}$ \\
+Context split & test for evaluation; train for nested tuning when available \\
 Sampling step $\Delta$ & $3600$ seconds (1 hour) \\
 Observation window $W$ & $18{,}000{,}000$ sec ($\approx 208.3$ days, $W/\Delta=5000$) \\
 $D_{\max}$ & $5000$ steps \\
@@ -594,7 +639,7 @@ After preprocessing the dataset, the following files are stored in the memmap di
 \texttt{X.npy}, \texttt{A.npy}, \texttt{R.npy}, \texttt{C.npy}, \texttt{D.npy}, \texttt{split.npy}, and \texttt{meta\_and\_stats.npz},
 as well as the auxiliary arrays \texttt{costs\_by\_arm.npy}, \texttt{delays\_pos.npy}, and \texttt{delays\_pos\_by\_arm.npz}. Optional files \texttt{arm\_ridge\_stats.npz} and \texttt{arm\_logistic\_stats.npz} store explicit per-arm reward-model parameters fit on the train split.
 
-The experiment scripts produce CSV logs and generate plots (cumulative reward/cost curves, Pareto plots, and the dependence on $\rho$ and $\gamma$). We additionally generate held-out simulator diagnostics, including calibration curves, train-vs-test delay CDFs, and arm-level train-vs-test stability checks for costs and delays.
+The experiment scripts produce CSV logs and generate plots for the dependence on $\rho$ and $\gamma$, cumulative reward/cost curves, delay ablations, and held-out simulator diagnostics, including calibration curves, train-vs-test delay CDFs, and arm-level train-vs-test stability checks for costs and delays.
 \section{Discussion}
 \label{sec:discussion}
 
@@ -637,7 +682,7 @@ If the context-free baseline performs similarly to PD-LinUCB, this indicates tha
 
 \subsection{Limitations and Future Directions}
 
-Although our experiments use real cost and conversion timestamp fields and a large-scale prototype built on the full dataset, the current framework remains a simulator: rewards are generated from a calibrated arm-specific model, and the online cost is aggregated to an arm-dependent value. 
+Although our experiments use real cost and conversion timestamp fields and a large-scale prototype built on the full Criteo log with a temporal train/test split, the current framework remains a simulator: rewards are generated from a calibrated arm-specific model, and the online cost is aggregated to an arm-dependent value. 
 
 Several extensions are particularly promising. First, many practical applications involve context-dependent costs $c_t(a,x_t)$ (e.g., in advertising auctions). Second, more general resource constraints may arise, including multiple simultaneous resources (the CBwLC setting) with vector-valued dual variables \cite{slivkins2023contextual,slivkins2024cbwlc}. Third, a more expressive reward model such as GLM-UCB could better reflect the Bernoulli nature of the response. Finally, non-stationary environments—where delays interact with distribution drift—represent an important direction for future work. In all these cases, the same central principle remains: resource prices should adapt online, while delayed feedback requires a clear separation between instantaneous information (context and cost) and delayed signals (rewards).
 
@@ -648,7 +693,7 @@ In practical settings with a global budget and delayed feedback, two loops must 
 \section{Conclusion}
 \label{sec:conclusion}
 
-In this paper, we studied a contextual bandit problem with a budget constraint and delayed feedback under the stop-at-budget protocol, where costs are incurred immediately while rewards may be observed with delay. We proposed a simple and reproducible algorithm, PD-LinUCB --- a variant of Disjoint LinUCB with Lagrangian (primal--dual) budget control implemented via a dynamic dual variable $\lambda_t$ and delayed-feedback semantics based on the design-now, reward-later update scheme. For empirical evaluation, we developed a scalable prototype built on the full Criteo Attribution dataset (16,468,027 records), stored in memmap format and using real cost and conversion timestamp fields to model both resource consumption and delays, including observation-window censoring.
+In this paper, we studied a contextual bandit problem with a budget constraint and delayed feedback under the stop-at-budget protocol, where costs are incurred immediately while rewards may be observed with delay. We proposed a simple and reproducible algorithm, PD-LinUCB --- a variant of Disjoint LinUCB with Lagrangian (primal--dual) budget control implemented via a dynamic dual variable $\lambda_t$ and delayed-feedback semantics based on the design-now, reward-later update scheme. For empirical evaluation, we developed a scalable semi-synthetic benchmark built on the full Criteo Attribution dataset (16,468,027 records), stored in memmap format and split temporally into train and test portions, using real cost and conversion timestamp fields to model both resource consumption and delays, including observation-window censoring.
 
 Our experiments demonstrate that the adaptive primal--dual mechanism provides robust performance improvements compared with both cost-agnostic LinUCB and simple cost-aware heuristics. In particular, PD-LinUCB consistently achieves higher total reward while maintaining comparable budget utilization under the stop-at-budget protocol. In contrast, the fixed-penalty heuristic $\mathrm{UCB}-\gamma c$ shows strong sensitivity to the choice of $\gamma$: the optimal value $\gamma^\star$ depends on the budget regime and may push the method into different behavioral regimes, sometimes leading to budget underutilization. This observation motivates evaluating algorithms jointly in terms of total reward and budget utilization ($\mathrm{spent}/B$), rather than relying on a single metric. Overall, the results indicate that the adaptive multiplier $\lambda_t$ provides a practical alternative to manually tuning a fixed penalty, stabilizing the cost trajectory and overall performance under delayed feedback.
 
@@ -928,9 +973,9 @@ otherwise add $(a_t,x_t,r_t)$ to \texttt{pending[$t+D_t$]}.
 \begin{center}
 \begin{tabular}{p{0.95\linewidth}}
 \toprule
-\textbf{Algorithm 3: CostNormUCB[ratio]} \\
+\textbf{Algorithm 3: CostNormUCB[ratio] + feasible-set stop-at-budget} \\
 \midrule
-\textbf{Parameters:} $K,d,\lambda,\alpha$, $\varepsilon>0$.\\
+\textbf{Parameters:} $K,d,\lambda,\alpha$, $\varepsilon>0$, budget $B$, horizon $T$.\\
 \textbf{Initialization:} same as in Algorithm~1.\\
 
 \textbf{For} $t=1,\dots,T$:
@@ -938,13 +983,25 @@ otherwise add $(a_t,x_t,r_t)$ to \texttt{pending[$t+D_t$]}.
 
 \item Apply pending updates as in Algorithm~1 (updates of $b_a$).
 
-\item For each arm $a$, compute $\mathrm{UCB}_t(x_t,a)$ as in~\eqref{eq:ucb}.
+\item \textbf{Feasible set (stop-at-budget):}
+\[
+\mathcal{A}_t=
+\{a\in\mathcal{A}: \mathrm{spent}_{t-1}+c(a)\le B\}.
+\]
+If $\mathcal{A}_t=\varnothing$, stop and set $\tau=t-1$.
+
+\item For each arm $a\in\mathcal{A}_t$, compute $\mathrm{UCB}_t(x_t,a)$ as in~\eqref{eq:ucb}.
 
 \item \textbf{Action selection:}
 \[
 a_t \leftarrow 
-\arg\max_a 
+\arg\max_{a\in\mathcal{A}_t}
 \frac{\mathrm{UCB}_t(x_t,a)}{c(a)+\varepsilon}.
+\]
+
+\item \textbf{Commit cost:}
+\[
+\mathrm{spent}_t\leftarrow \mathrm{spent}_{t-1}+c(a_t).
 \]
 
 \item Immediately update $A_{a_t}$ (as in Algorithm~1), then receive $(r_t,c_t,D_t)$ from the environment and update $b_{a_t}$: immediately if $D_t=0$, otherwise schedule the update in \texttt{pending[$t+D_t$]}.
@@ -960,9 +1017,9 @@ a_t \leftarrow
 \begin{center}
 \begin{tabular}{p{0.95\linewidth}}
 \toprule
-\textbf{Algorithm 4: CostNormUCB[sub]} \\
+\textbf{Algorithm 4: CostNormUCB[sub] + feasible-set stop-at-budget} \\
 \midrule
-\textbf{Parameters:} $K,d,\lambda,\alpha$, fixed penalty $\gamma\ge 0$.\\
+\textbf{Parameters:} $K,d,\lambda,\alpha$, fixed penalty $\gamma\ge 0$, budget $B$, horizon $T$.\\
 \textbf{Initialization:} same as in Algorithm~1.\\
 
 \textbf{For} $t=1,\dots,T$:
@@ -970,13 +1027,25 @@ a_t \leftarrow
 
 \item Apply pending updates as in Algorithm~1 (updates of $b_a$).
 
-\item For each arm $a$, compute $\mathrm{UCB}_t(x_t,a)$ as in~\eqref{eq:ucb}.
+\item \textbf{Feasible set (stop-at-budget):}
+\[
+\mathcal{A}_t=
+\{a\in\mathcal{A}: \mathrm{spent}_{t-1}+c(a)\le B\}.
+\]
+If $\mathcal{A}_t=\varnothing$, stop and set $\tau=t-1$.
+
+\item For each arm $a\in\mathcal{A}_t$, compute $\mathrm{UCB}_t(x_t,a)$ as in~\eqref{eq:ucb}.
 
 \item \textbf{Action selection:}
 \[
 a_t \leftarrow 
-\arg\max_a 
+\arg\max_{a\in\mathcal{A}_t}
 \big(\mathrm{UCB}_t(x_t,a)-\gamma\,c(a)\big).
+\]
+
+\item \textbf{Commit cost:}
+\[
+\mathrm{spent}_t\leftarrow \mathrm{spent}_{t-1}+c(a_t).
 \]
 
 \item Immediately update $A_{a_t}$ (as in Algorithm~1), then receive $(r_t,c_t,D_t)$ and update $b_{a_t}$: immediately if $D_t=0$, otherwise schedule the update in \texttt{pending[$t+D_t$]}.

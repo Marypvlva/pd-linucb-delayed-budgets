@@ -80,9 +80,8 @@ def collect_reward_metrics(
     sum_logloss = 0.0
     sum_pred = 0.0
     sum_true = 0.0
-    bin_counts = np.zeros((n_bins,), dtype=np.int64)
-    bin_sum_pred = np.zeros((n_bins,), dtype=np.float64)
-    bin_sum_true = np.zeros((n_bins,), dtype=np.float64)
+    preds_parts: list[np.ndarray] = []
+    truth_parts: list[np.ndarray] = []
 
     for start in range(0, idx.shape[0], batch):
         batch_idx = idx[start:start + batch]
@@ -96,15 +95,8 @@ def collect_reward_metrics(
         sum_logloss += float(-np.sum(Rb * np.log(Pb) + (1.0 - Rb) * np.log(1.0 - Pb)))
         sum_pred += float(np.sum(Pb))
         sum_true += float(np.sum(Rb))
-
-        bins = np.minimum((Pb * n_bins).astype(np.int64), n_bins - 1)
-        for b in range(n_bins):
-            mask = (bins == b)
-            if not bool(np.any(mask)):
-                continue
-            bin_counts[b] += int(np.sum(mask))
-            bin_sum_pred[b] += float(np.sum(Pb[mask]))
-            bin_sum_true[b] += float(np.sum(Rb[mask]))
+        preds_parts.append(Pb.astype(np.float32, copy=False))
+        truth_parts.append(Rb.astype(np.float32, copy=False))
 
     metrics = {
         "brier": sum_brier / max(total, 1),
@@ -112,9 +104,38 @@ def collect_reward_metrics(
         "mean_pred": sum_pred / max(total, 1),
         "mean_true": sum_true / max(total, 1),
     }
-    pred_curve = np.divide(bin_sum_pred, np.maximum(bin_counts, 1), dtype=np.float64)
-    true_curve = np.divide(bin_sum_true, np.maximum(bin_counts, 1), dtype=np.float64)
-    return metrics, pred_curve, true_curve
+    preds = np.concatenate(preds_parts, axis=0).astype(np.float64, copy=False)
+    truths = np.concatenate(truth_parts, axis=0).astype(np.float64, copy=False)
+    return metrics, preds, truths
+
+
+def calibration_curve_quantile(
+    preds: np.ndarray,
+    truths: np.ndarray,
+    n_bins: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    quantiles = np.linspace(0.0, 1.0, int(n_bins) + 1)
+    edges = np.quantile(preds, quantiles)
+    edges = np.unique(edges)
+    if edges.size < 2:
+        return np.asarray([float(np.mean(preds))]), np.asarray([float(np.mean(truths))]), np.asarray([int(preds.size)])
+
+    bins = np.searchsorted(edges[1:-1], preds, side="right")
+    n_eff = edges.size - 1
+    mean_pred = np.zeros((n_eff,), dtype=np.float64)
+    mean_true = np.zeros((n_eff,), dtype=np.float64)
+    counts = np.zeros((n_eff,), dtype=np.int64)
+
+    for b in range(n_eff):
+        mask = (bins == b)
+        if not bool(np.any(mask)):
+            continue
+        counts[b] = int(np.sum(mask))
+        mean_pred[b] = float(np.mean(preds[mask]))
+        mean_true[b] = float(np.mean(truths[mask]))
+
+    keep = counts > 0
+    return mean_pred[keep], mean_true[keep], counts[keep]
 
 
 def summarize_arm_stat_from_indices(
@@ -195,9 +216,33 @@ def main():
     reward_models = [x.strip() for x in args.reward_models.split(",") if x.strip()]
     if not reward_models:
         raise RuntimeError("Empty --reward_models")
+    available_models = {"linear_clip"}
+    logistic_path = memmap_dir / "arm_logistic_stats.npz"
+    if logistic_path.exists():
+        available_models.add("logistic")
+    if reward_models == ["auto"]:
+        reward_models = ["linear_clip"]
+        if "logistic" in available_models:
+            reward_models.append("logistic")
+    missing_models = [model for model in reward_models if model not in available_models]
+    if missing_models:
+        if missing_models == ["logistic"]:
+            raise SystemExit(
+                "Requested reward_model=logistic for diagnostics, but "
+                f"{logistic_path} does not exist.\n"
+                "Fit it first with:\n"
+                "  python -m src.env.compute_arm_logistic_stats_from_memmap "
+                f"--memmap_dir {memmap_dir} --split train --lam 1.0 --max_iter 8 --out arm_logistic_stats.npz\n"
+                "Or run diagnostics with:\n"
+                "  --reward_models linear_clip"
+            )
+        raise SystemExit(
+            f"Requested unsupported or unavailable reward_models={missing_models}. "
+            f"Available models: {sorted(available_models)}"
+        )
 
     rows = []
-    calibration_curves: list[tuple[str, np.ndarray, np.ndarray]] = []
+    calibration_curves: list[tuple[str, np.ndarray, np.ndarray, np.ndarray]] = []
 
     fit_pos_mask = np.asarray(R[idx_fit], dtype=np.uint8) == 1
     eval_pos_mask = np.asarray(R[idx_eval], dtype=np.uint8) == 1
@@ -244,13 +289,18 @@ def main():
             context_split="all",
             reward_model=reward_model,
         )
-        metrics, pred_curve, true_curve = collect_reward_metrics(
+        metrics, preds, truths = collect_reward_metrics(
             env=env,
             X=X,
             A=A,
             R=R,
             idx=idx_eval,
             batch=int(args.batch),
+            n_bins=int(args.n_bins),
+        )
+        pred_curve, true_curve, counts_curve = calibration_curve_quantile(
+            preds=preds,
+            truths=truths,
             n_bins=int(args.n_bins),
         )
         model_name = str(env.meta.get("reward_model_loaded", env.reward_model))
@@ -264,15 +314,16 @@ def main():
             "arm_delay_mae": arm_delay_mae,
             "arm_cost_mae": arm_cost_mae,
         })
-        calibration_curves.append((model_name, pred_curve, true_curve))
+        calibration_curves.append((model_name, pred_curve, true_curve, counts_curve))
 
     plt.figure()
     plt.plot([0.0, 1.0], [0.0, 1.0], linestyle="--", color="black", linewidth=1.0, label="ideal")
-    for label, pred_curve, true_curve in calibration_curves:
-        plt.plot(pred_curve, true_curve, marker="o", label=label)
+    for label, pred_curve, true_curve, counts_curve in calibration_curves:
+        yerr = 1.96 * np.sqrt(np.clip(true_curve * (1.0 - true_curve) / np.maximum(counts_curve, 1), 0.0, None))
+        plt.errorbar(pred_curve, true_curve, yerr=yerr, marker="o", capsize=3, linewidth=1.5, label=label)
     plt.xlabel("Mean predicted probability")
     plt.ylabel("Empirical positive rate")
-    plt.title(f"Simulator calibration on {eval_split} rows")
+    plt.title(f"Simulator calibration on {eval_split} rows (quantile bins)")
     plt.grid(True, alpha=0.3)
     plt.legend()
     plt.tight_layout()
