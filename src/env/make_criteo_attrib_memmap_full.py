@@ -61,7 +61,22 @@ def main():
     ap.add_argument("--chunksize", type=int, default=200_000)
     ap.add_argument("--limit_rows", type=int, default=0,
                     help="0 = весь датасет; иначе ограничить первыми N строками (для теста)")
+    ap.add_argument(
+        "--train_frac",
+        type=float,
+        default=1.0,
+        help="Fraction of rows assigned to the train split used for fitting simulator parameters. <1 enables train/test split.",
+    )
+    ap.add_argument(
+        "--split_seed",
+        type=int,
+        default=123,
+        help="Seed for reproducible train/test row assignment when --train_frac < 1.0.",
+    )
     args = ap.parse_args()
+
+    if not (0.0 < float(args.train_frac) <= 1.0):
+        raise ValueError("--train_frac must be in (0, 1].")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -88,6 +103,7 @@ def main():
     print("d =", d, "k_cap =", k_cap)
     print("delta_seconds =", delta, "censor_seconds =", W,
           "=> censor_steps =", censor_steps, "d_max =", d_max)
+    print("train_frac =", float(args.train_frac), "split_seed =", int(args.split_seed))
 
     # --- allocate memmaps ---
     X = open_memmap(out_dir / "X.npy", shape=(n, d), dtype=np.float32)
@@ -100,6 +116,8 @@ def main():
     # store delay in STEPS, always >=0
     # no-delay ablation should be created later by setting D[:] = 0
     D = open_memmap(out_dir / "D.npy", shape=(n,), dtype=np.int32)
+    split_enabled = float(args.train_frac) < 1.0
+    split = open_memmap(out_dir / "split.npy", shape=(n,), dtype=np.uint8) if split_enabled else None
 
     # --- per-arm sufficient stats for ridge (arm-specific reward model) ---
     XtX_arm = np.zeros((k_cap, d, d), dtype=np.float64)
@@ -113,6 +131,9 @@ def main():
     delays_pos_parts = []
 
     cat_cols = ["uid"] + [f"cat{i}" for i in range(1, 10)]
+    split_rng = np.random.default_rng(int(args.split_seed))
+    n_train = 0
+    n_test = 0
 
     read_kwargs = dict(sep="\t", compression="infer", chunksize=args.chunksize)
     if has_header:
@@ -128,6 +149,16 @@ def main():
         n_take = min(len(chunk), n - write)
         chunk = chunk.iloc[:n_take].copy()
         idx = slice(write, write + n_take)
+
+        if split_enabled:
+            split_chunk = (split_rng.random(n_take) >= float(args.train_frac)).astype(np.uint8)
+            split[idx] = split_chunk
+            fit_mask = (split_chunk == 0)
+            n_train += int(np.sum(fit_mask))
+            n_test += int(n_take - np.sum(fit_mask))
+        else:
+            fit_mask = np.ones((n_take,), dtype=bool)
+            n_train += int(n_take)
 
         # --- action: hash(campaign) % k_cap ---
         camp = chunk["campaign"].astype(str)
@@ -165,8 +196,9 @@ def main():
         D[idx] = D_chunk
 
         # collect positive delays for later inspection / simulator
-        if valid_pos.any():
-            delays_pos_parts.append(D_chunk[valid_pos].astype(np.int32, copy=False))
+        fit_pos = valid_pos & fit_mask
+        if fit_pos.any():
+            delays_pos_parts.append(D_chunk[fit_pos].astype(np.int32, copy=False))
 
         # --- context X: hashing uid+cat1..cat9 into d_hash, plus numeric feature ---
         X_chunk = np.zeros((n_take, d), dtype=np.float32)
@@ -188,8 +220,8 @@ def main():
         a32 = a.astype(np.int32, copy=False)
 
         # loop only over arms present in the chunk (faster than range(k_cap))
-        for aa in np.unique(a32):
-            m = (a32 == aa)
+        for aa in np.unique(a32[fit_mask]):
+            m = fit_mask & (a32 == aa)
             if not m.any():
                 continue
             Xa = X64[m]
@@ -205,6 +237,8 @@ def main():
 
     # flush memmaps
     X.flush(); A.flush(); R.flush(); C.flush(); D.flush()
+    if split is not None:
+        split.flush()
 
     # finalize derived arrays
     # mean cost per arm (avoid division by 0)
@@ -224,7 +258,13 @@ def main():
         "censor_seconds": int(W),
         "censor_steps": int(censor_steps),
         "d_max": int(d_max),
-        "inp": args.inp
+        "inp": args.inp,
+        "has_split": bool(split_enabled),
+        "fit_split": "train" if split_enabled else "all",
+        "train_frac": float(args.train_frac),
+        "split_seed": int(args.split_seed),
+        "n_train": int(n_train),
+        "n_test": int(n_test),
     }
     np.savez(
         out_dir / "meta_and_stats.npz",
@@ -237,6 +277,9 @@ def main():
 
     print("DONE. Saved memmaps to:", out_dir)
     print("Rows written:", write)
+    if split_enabled:
+        print("Train rows:", n_train, "Test rows:", n_test)
+        print("Saved:", out_dir / "split.npy")
     print("Saved:", out_dir / "costs_by_arm.npy")
     print("Saved:", out_dir / "delays_pos.npy")
     print("Saved:", out_dir / "meta_and_stats.npz")

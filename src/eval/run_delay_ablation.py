@@ -50,6 +50,13 @@ def main():
     ap.add_argument("--n_seeds", type=int, default=10)
     ap.add_argument("--seed0", type=int, default=123)
     ap.add_argument("--env_seed", type=int, default=0)
+    ap.add_argument(
+        "--context_split",
+        type=str,
+        default="auto",
+        choices=["auto", "all", "train", "test"],
+        help="Which context split to sample from. 'auto' uses test when split metadata exists.",
+    )
 
     ap.add_argument("--alpha_lin", type=float, default=1.0)
     ap.add_argument("--alpha_pd", type=float, default=1.5)
@@ -69,7 +76,13 @@ def main():
     tab_dir = artifact_dir / "tables"
     tab_dir.mkdir(parents=True, exist_ok=True)
 
-    env_base = SimBanditEnv.from_memmap_dir(args.memmap_dir, seed=args.env_seed, ridge_lambda=1.0, cost_mode="lin")
+    env_base = SimBanditEnv.from_memmap_dir(
+        args.memmap_dir,
+        seed=args.env_seed,
+        ridge_lambda=1.0,
+        cost_mode="lin",
+        context_split=args.context_split,
+    )
     seeds = [int(args.seed0 + i) for i in range(int(args.n_seeds))]
 
     store = {

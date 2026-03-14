@@ -43,6 +43,8 @@ class SimBanditEnv:
 
     # raw metadata from meta_and_stats.npz (optional, for reporting)
     meta: dict | None = None
+    context_index: np.ndarray | None = None
+    context_split: str = "all"
 
     @property
     def n(self) -> int:
@@ -76,6 +78,8 @@ class SimBanditEnv:
             w=self.w,
             b=self.b,
             meta=self.meta,
+            context_index=self.context_index,
+            context_split=self.context_split,
         )
 
     def with_delays(
@@ -165,6 +169,7 @@ class SimBanditEnv:
         cost_mode: str = "lin",
         delay_pool_size: int = 200_000,
         normalize_costs: bool = True,
+        context_split: str = "auto",
     ) -> "SimBanditEnv":
         """
         Load an environment from a memmap directory created by make_criteo_attrib_memmap_full.py.
@@ -181,6 +186,27 @@ class SimBanditEnv:
         n = int(meta["n"])
         d = int(meta["d"])
         K = int(meta["k_cap"])
+        has_split = bool(meta.get("has_split", False)) and (p / "split.npy").exists()
+
+        if context_split not in {"auto", "all", "train", "test"}:
+            raise ValueError("context_split must be one of: auto, all, train, test")
+        if context_split == "auto":
+            effective_context_split = "test" if has_split and int(meta.get("n_test", 0)) > 0 else "all"
+        else:
+            effective_context_split = context_split
+
+        context_index = None
+        if effective_context_split != "all":
+            split_path = p / "split.npy"
+            if not split_path.exists():
+                raise ValueError(f"context_split={effective_context_split} requested, but {split_path} does not exist")
+            split = np.load(split_path, mmap_mode="r")
+            split_code = 0 if effective_context_split == "train" else 1
+            context_index = np.flatnonzero(split == split_code)
+            if context_index.size == 0:
+                raise ValueError(f"context_split={effective_context_split} selected zero rows in {split_path}")
+            if n <= np.iinfo(np.uint32).max:
+                context_index = context_index.astype(np.uint32, copy=False)
 
         # ---- censor window W (in steps) ----
         censor_steps = int(meta.get("censor_steps", meta.get("max_delay", meta.get("d_max", 0))))
@@ -246,24 +272,36 @@ class SimBanditEnv:
         arm_path = p / "arm_ridge_stats.npz"
         if arm_path.exists():
             arm = np.load(arm_path, allow_pickle=True)
-            if "Theta" not in arm.files:
-                raise ValueError("arm_ridge_stats.npz exists but has no 'Theta'")
-            Theta = arm["Theta"].astype(np.float32)
-            if Theta.shape != (K, d):
-                raise ValueError(f"Theta shape mismatch: expected {(K, d)}, got {Theta.shape}")
-            return cls(
-                X_data=X,
-                D_data=D,
-                costs=costs,
-                rng=rng,
-                delay_pool=delay_pool,
-                censor_steps=censor_steps,
-                Theta=Theta,
-                meta=meta,
-            )
+            arm_row_split = "all"
+            if "row_split" in arm.files:
+                raw_split = arm["row_split"]
+                arm_row_split = str(raw_split.item() if getattr(raw_split, "shape", ()) == () else raw_split)
+            use_arm_file = not (has_split and str(meta.get("fit_split", "all")) == "train" and arm_row_split not in {"train", "fit"})
+            if use_arm_file:
+                if "Theta" not in arm.files:
+                    raise ValueError("arm_ridge_stats.npz exists but has no 'Theta'")
+                Theta = arm["Theta"].astype(np.float32)
+                if Theta.shape != (K, d):
+                    raise ValueError(f"Theta shape mismatch: expected {(K, d)}, got {Theta.shape}")
+                meta_loaded = dict(meta)
+                meta_loaded["context_split"] = effective_context_split
+                return cls(
+                    X_data=X,
+                    D_data=D,
+                    costs=costs,
+                    rng=rng,
+                    delay_pool=delay_pool,
+                    censor_steps=censor_steps,
+                    Theta=Theta,
+                    meta=meta_loaded,
+                    context_index=context_index,
+                    context_split=effective_context_split,
+                )
 
         Theta = cls._compute_theta_from_arm_stats(meta_stats, K=K, d=d, ridge_lambda=ridge_lambda)
         if Theta is not None:
+            meta_loaded = dict(meta)
+            meta_loaded["context_split"] = effective_context_split
             return cls(
                 X_data=X,
                 D_data=D,
@@ -272,7 +310,9 @@ class SimBanditEnv:
                 delay_pool=delay_pool,
                 censor_steps=censor_steps,
                 Theta=Theta,
-                meta=meta,
+                meta=meta_loaded,
+                context_index=context_index,
+                context_split=effective_context_split,
             )
 
         # ---- fallback: global linear w + per-arm bias b ----
@@ -308,6 +348,8 @@ class SimBanditEnv:
             mean_x = sum_x / np.maximum(cnt[:, None], 1.0)
             b = (mean_r - (mean_x @ w.astype(np.float64))).astype(np.float32)
 
+        meta_loaded = dict(meta)
+        meta_loaded["context_split"] = effective_context_split
         return cls(
             X_data=X,
             D_data=D,
@@ -317,7 +359,9 @@ class SimBanditEnv:
             censor_steps=censor_steps,
             w=w,
             b=b,
-            meta=meta,
+            meta=meta_loaded,
+            context_index=context_index,
+            context_split=effective_context_split,
         )
 
     # ------------------------ interaction ------------------------
@@ -325,7 +369,11 @@ class SimBanditEnv:
     def sample_contexts(self, T: int, rng: np.random.Generator | None = None) -> np.ndarray:
         """Sample a context sequence. Use a dedicated rng for paired comparisons."""
         rng = self.rng if rng is None else rng
-        idx = rng.integers(0, self.n, size=int(T))
+        if self.context_index is None:
+            idx = rng.integers(0, self.n, size=int(T))
+        else:
+            pool_idx = rng.integers(0, int(self.context_index.shape[0]), size=int(T))
+            idx = self.context_index[pool_idx]
         return np.asarray(self.X_data[idx], dtype=np.float32)
 
     def step(self, x: np.ndarray, a: int) -> tuple[float, float, int]:

@@ -41,64 +41,135 @@ python -m pip install -U pip wheel
 python -m pip install -r requirements.txt
 ```
 
-## 1) Preprocess Criteo into memmaps
+## 1) Build a train/test memmap artifact
+
+For a leakage-clean split, fit the simulator on train rows and evaluate on test contexts. The command below creates one artifact with:
+
+- full row memmaps (`X.npy`, `A.npy`, `R.npy`, `C.npy`, `D.npy`)
+- `split.npy` with `0=train`, `1=test`
+- train-only fit stats in `meta_and_stats.npz`
+- train-only `costs_by_arm.npy` and `delays_pos.npy`
 
 ```bash
 python -m src.env.make_criteo_attrib_memmap_full \
   --inp data/raw/criteo_attrib/criteo_attribution_dataset.tsv.gz \
-  --out_dir data/processed/criteo_full_k50_d64_real \
+  --out_dir data/processed/criteo_full_k50_d64_real_split80 \
   --k_cap 50 --d_hash 64 \
   --delta_seconds 3600 \
   --censor_seconds $((5000*3600)) \
-  --d_max 5000
+  --d_max 5000 \
+  --train_frac 0.8 \
+  --split_seed 123
 ```
 
-Optional arm-wise ridge stats:
+Optional: precompute explicit arm-wise ridge parameters on the train split. This is not required, because `meta_and_stats.npz` already contains train-only sufficient statistics.
 
 ```bash
 python -m src.env.compute_arm_ridge_stats_from_memmap \
-  --memmap_dir data/processed/criteo_full_k50_d64_real \
+  --memmap_dir data/processed/criteo_full_k50_d64_real_split80 \
+  --split train \
   --lam 1.0 --out arm_ridge_stats.npz
 ```
 
-## 2) Generate paper artifacts
+## 2) Run the full experiment suite on test contexts
 
-Main comparison with mean±CI curves and the LaTeX summary table:
+All evaluation scripts support `--context_split auto`, which means:
+
+- if `split.npy` exists, sample contexts from the test split
+- otherwise, sample from all rows
+
+To avoid Matplotlib cache warnings in headless runs:
+
+```bash
+export MPLBACKEND=Agg
+export MPLCONFIGDIR="$(pwd)/.mplconfig"
+mkdir -p "$MPLCONFIGDIR"
+```
+
+### Main comparison
 
 ```bash
 python -m src.eval.run_compare_baselines \
-  --memmap_dir data/processed/criteo_full_k50_d64_real \
+  --memmap_dir data/processed/criteo_full_k50_d64_real_split80 \
+  --context_split auto \
   --T 5000 --budget_ratio 0.7 --stop_at_budget \
   --n_seeds 10 --seed0 123 \
   --artifact_dir paper_artifacts \
-  --tag T5000_rho0.7
+  --tag T5000_rho0.7_split80
 ```
 
-Gamma sweep for `CostNormUCB[sub]`:
+Outputs:
+
+- `paper_artifacts/tables/main_ci.tex`
+- `paper_artifacts/figures/baselines_cum_reward_full4_arm.png`
+- `paper_artifacts/figures/baselines_cum_cost_full4_arm.png`
+- `paper_artifacts/figures/baselines_spent_schedule.png`
+- `paper_artifacts/figures/avg_cost_per_step.png`
+- `paper_artifacts/figures/baselines_cum_reward_mean_ci.png`
+- `paper_artifacts/figures/baselines_cum_cost_mean_ci.png`
+
+### Gamma sweep
 
 ```bash
 python -m src.eval.run_gamma_sweep \
-  --memmap_dir data/processed/criteo_full_k50_d64_real \
+  --memmap_dir data/processed/criteo_full_k50_d64_real_split80 \
+  --context_split auto \
   --T 5000 --budget_ratio 0.7 --stop_at_budget \
   --n_seeds 10 --seed0 123
 ```
 
-Delay vs no-delay ablation:
+Outputs:
+
+- `paper_artifacts/figures/gamma_sweep_rho0.7_T5000/gamma_sweep_raw.csv`
+- `paper_artifacts/figures/gamma_sweep_rho0.7_T5000/gamma_sweep_summary.csv`
+- `paper_artifacts/figures/gamma_sweep_rho0.7_T5000/gamma_sweep_reward.png`
+- `paper_artifacts/figures/gamma_sweep_rho0.7_T5000/gamma_sweep_spent.png`
+
+### Delay vs no-delay ablation
 
 ```bash
 python -m src.eval.run_delay_ablation \
-  --memmap_dir data/processed/criteo_full_k50_d64_real \
+  --memmap_dir data/processed/criteo_full_k50_d64_real_split80 \
+  --context_split auto \
   --T 5000 --budget_ratio 0.7 --stop_at_budget \
-  --n_seeds 10 --seed0 123
+  --n_seeds 10 --seed0 123 \
+  --artifact_dir paper_artifacts
 ```
 
-Budget sweep over `rho=B/T` with per-rho `gamma*` selection:
+Output:
+
+- `paper_artifacts/tables/delay_ablation.tex`
+
+### Budget sweep
 
 ```bash
 python -m src.eval.run_budget_sweep_baselines \
-  --memmap_dir data/processed/criteo_full_k50_d64_real \
+  --memmap_dir data/processed/criteo_full_k50_d64_real_split80 \
+  --context_split auto \
   --T 5000 --stop_at_budget \
   --budgets 0.40,0.55,0.70,0.85 \
   --gammas 0,0.1,0.3,1,2,3,5,10 \
-  --n_seeds 10 --seed0 123
+  --n_seeds 10 --seed0 123 \
+  --artifact_dir paper_artifacts
 ```
+
+Outputs:
+
+- `paper_artifacts/tables/budget_sweep_raw.csv`
+- `paper_artifacts/tables/budget_sweep_summary.csv`
+- `paper_artifacts/tables/budget_sweep.tex`
+- `paper_artifacts/figures/budget_sweep_reward.png`
+- `paper_artifacts/figures/budget_sweep_gamma_star.png`
+- `paper_artifacts/figures/budget_sweep_spent.png`
+
+## 3) One-command evaluation runner
+
+After preprocessing, you can run the full suite with:
+
+```bash
+bash scripts/run_full_paper_experiments.sh \
+  data/processed/criteo_full_k50_d64_real_split80 \
+  paper_artifacts
+```
+
+When that finishes, the figures to upload to Overleaf are in `paper_artifacts/figures/`, and the LaTeX tabulars are in `paper_artifacts/tables/`.
