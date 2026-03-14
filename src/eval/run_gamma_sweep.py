@@ -13,11 +13,14 @@ import csv
 from dataclasses import dataclass
 
 import numpy as np
+
+import src.eval.mpl_setup  # noqa: F401
 import matplotlib.pyplot as plt
 
 from src.env.sim_bandit_env import SimBanditEnv
 from src.algos.cost_normalized_ucb import CostNormalizedDisjointUCB
 from src.algos.linucb_pd_delayed import PrimalDualLinUCB
+from src.algos.logistic_ucb_delayed import CostNormalizedDisjointLogisticUCB, PrimalDualLogisticUCB
 from src.eval.runner_utils import mean_ci, run_contextual_delayed
 
 
@@ -73,6 +76,20 @@ def main():
         choices=["auto", "all", "train", "test"],
         help="Which context split to sample from. 'auto' uses test when split metadata exists.",
     )
+    ap.add_argument(
+        "--reward_model",
+        type=str,
+        default="auto",
+        choices=["auto", "linear_clip", "logistic"],
+        help="Reward model used by the simulator.",
+    )
+    ap.add_argument(
+        "--policy_model",
+        type=str,
+        default="linear",
+        choices=["linear", "logistic"],
+        help="Contextual learner family for CostNorm / PD baseline.",
+    )
 
     ap.add_argument("--alpha_cnu", type=float, default=1.0)
     ap.add_argument("--lam", type=float, default=1.0)
@@ -88,6 +105,8 @@ def main():
         help="If empty, uses paper_artifacts/figures/gamma_sweep_rho{rho}_T{T}",
     )
     args = ap.parse_args()
+    costnorm_name = "CostNormLogisticUCB[sub]" if args.policy_model == "logistic" else "CostNormUCB[sub]"
+    pd_name = "PD-LogisticUCB" if args.policy_model == "logistic" else "PD-LinUCB"
 
     out_dir = Path(args.out_dir) if args.out_dir else Path(
         f"paper_artifacts/figures/gamma_sweep_rho{args.budget_ratio}_T{args.T}"
@@ -105,6 +124,7 @@ def main():
         ridge_lambda=1.0,
         cost_mode="lin",
         context_split=args.context_split,
+        reward_model=args.reward_model,
     )
 
     for si in range(args.n_seeds):
@@ -113,16 +133,30 @@ def main():
 
         for g in gammas:
             env = env_base.clone(seed=seed + 10_000 + int(round(g * 1000)))
-            algo = CostNormalizedDisjointUCB(
-                env.K, env.d,
-                costs=env.costs,
-                alpha=float(args.alpha_cnu),
-                lam=float(args.lam),
-                mode="sub",
-                gamma=float(g),
-                eps=1e-3,
-                seed=seed + 20_000 + int(round(g * 1000)),
-            )
+            if args.policy_model == "logistic":
+                algo = CostNormalizedDisjointLogisticUCB(
+                    env.K,
+                    env.d,
+                    costs=env.costs,
+                    alpha=float(args.alpha_cnu),
+                    lam=float(args.lam),
+                    mode="sub",
+                    gamma=float(g),
+                    eps=1e-3,
+                    seed=seed + 20_000 + int(round(g * 1000)),
+                )
+            else:
+                algo = CostNormalizedDisjointUCB(
+                    env.K,
+                    env.d,
+                    costs=env.costs,
+                    alpha=float(args.alpha_cnu),
+                    lam=float(args.lam),
+                    mode="sub",
+                    gamma=float(g),
+                    eps=1e-3,
+                    seed=seed + 20_000 + int(round(g * 1000)),
+                )
             res = run_contextual_delayed(
                 env, X_seq, algo,
                 budget_ratio=args.budget_ratio,
@@ -172,7 +206,7 @@ def main():
 
     plot_with_ci(
         x, reward, reward_ci,
-        title="CostNormUCB[sub]: mean total reward vs gamma (95% CI)",
+        title=f"{costnorm_name}: mean total reward vs gamma (95% CI)",
         xlabel="gamma (symlog axis)",
         ylabel="mean total reward",
         out_path=out_dir / "gamma_sweep_reward.png",
@@ -181,7 +215,7 @@ def main():
 
     plot_with_ci(
         x, spent, spent_ci,
-        title="CostNormUCB[sub]: mean spent/B vs gamma (95% CI)",
+        title=f"{costnorm_name}: mean spent/B vs gamma (95% CI)",
         xlabel="gamma (symlog axis)",
         ylabel="mean spent/B",
         out_path=out_dir / "gamma_sweep_spent.png",
@@ -194,14 +228,26 @@ def main():
             seed = int(args.seed0 + si)
             X_seq = env_base.sample_contexts(args.T, rng=np.random.default_rng(seed))
             env = env_base.clone(seed=seed + 30_000)
-            algo = PrimalDualLinUCB(
-                env.K, env.d,
-                costs=env.costs,
-                alpha=float(args.alpha_pd),
-                lam=float(args.lam),
-                eta=float(args.eta_pd),
-                seed=seed + 40_000,
-            )
+            if args.policy_model == "logistic":
+                algo = PrimalDualLogisticUCB(
+                    env.K,
+                    env.d,
+                    costs=env.costs,
+                    alpha=float(args.alpha_pd),
+                    lam=float(args.lam),
+                    eta=float(args.eta_pd),
+                    seed=seed + 40_000,
+                )
+            else:
+                algo = PrimalDualLinUCB(
+                    env.K,
+                    env.d,
+                    costs=env.costs,
+                    alpha=float(args.alpha_pd),
+                    lam=float(args.lam),
+                    eta=float(args.eta_pd),
+                    seed=seed + 40_000,
+                )
             res = run_contextual_delayed(
                 env, X_seq, algo,
                 budget_ratio=args.budget_ratio,
@@ -214,7 +260,7 @@ def main():
         pd_s = np.array([x.spent_ratio for x in pd_rows], dtype=float)
         pd_t = np.array([x.t_stop for x in pd_rows], dtype=float)
 
-        print("\nPD-LinUCB baseline (same T,rho):")
+        print(f"\n{pd_name} baseline (same T,rho):")
         print("reward mean=", pd_r.mean(), "std=", pd_r.std(ddof=1))
         print("spent/B mean=", pd_s.mean(), "std=", pd_s.std(ddof=1))
         print("t_stop mean=", pd_t.mean(), "std=", pd_t.std(ddof=1))

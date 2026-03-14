@@ -6,45 +6,44 @@ from pathlib import Path
 import numpy as np
 
 
+def sigmoid(z: np.ndarray | float) -> np.ndarray | float:
+    z = np.clip(z, -35.0, 35.0)
+    return 1.0 / (1.0 + np.exp(-z))
+
+
 @dataclass
 class SimBanditEnv:
     """
     Semi-synthetic contextual bandit environment built from logged data artifacts.
 
-    Key design choices:
-      - Contexts x_t are sampled from a fixed memmap array X.npy (rows from Criteo).
-      - Rewards are generated from a calibrated arm-specific linear model:
-            mu_a(x) = clip(theta_a^T x, 0, 1),   r ~ Bernoulli(mu_a(x)).
-        (Theta is fit offline via ridge regression.)
-      - Costs used by the online budget controller are arm-level averages c(a) (costs_by_arm.npy),
-        normalized to mean ~ 1.
-      - Delays:
-          * if r=1: delay is sampled from an empirical pool of positive delays (delays_pos.npy)
-          * if r=0: delay is the censoring window in steps (censor_steps), i.e. "no conversion confirmed after W".
-
-    Delay semantics returned by step():
-      - always returns dly >= 0  (NEVER -1)
-      - if r=1: dly sampled from delay_pool (may include 0)
-      - if r=0: dly = censor_steps (censoring; "no conversion" confirmed after W steps)
-        If censor_steps==0 -> immediate feedback for r=0 (no-delay mode).
+    Main behavior:
+      - Contexts are sampled from X.npy, optionally restricted to a split (train/test).
+      - Rewards are generated from either:
+          * logistic arm-specific model: sigmoid(theta_a^T x + bias_a)
+          * legacy clipped-linear model: clip(theta_a^T x, 0, 1)
+          * fallback global linear model: clip(w^T x + b_a, 0, 1)
+      - Costs used online are arm-level averages c(a) computed on the fit split.
+      - Positive delays can be global or arm-conditional, depending on available artifacts.
     """
 
-    X_data: np.ndarray          # memmap/ndarray (n,d)
-    D_data: np.ndarray          # memmap/ndarray (n,) may contain -1 on disk (not used online)
-    costs: np.ndarray           # (K,) arm-level costs (float32)
+    X_data: np.ndarray
+    D_data: np.ndarray
+    costs: np.ndarray
     rng: np.random.Generator
-    delay_pool: np.ndarray      # (m,) delays in steps, >=0 (int32)
-    censor_steps: int           # W in steps, >=0
+    delay_pool: np.ndarray
+    censor_steps: int
 
-    # reward model (linear + clipping; consistent with LinUCB)
-    Theta: np.ndarray | None = None     # (K,d) if available
-    w: np.ndarray | None = None         # (d,) fallback global linear
-    b: np.ndarray | None = None         # (K,) fallback per-arm bias
+    Theta: np.ndarray | None = None
+    intercept: np.ndarray | None = None
+    w: np.ndarray | None = None
+    b: np.ndarray | None = None
 
-    # raw metadata from meta_and_stats.npz (optional, for reporting)
     meta: dict | None = None
     context_index: np.ndarray | None = None
     context_split: str = "all"
+    reward_model: str = "linear_clip"
+    delay_values_by_arm: np.ndarray | None = None
+    delay_offsets_by_arm: np.ndarray | None = None
 
     @property
     def n(self) -> int:
@@ -63,7 +62,6 @@ class SimBanditEnv:
         raise RuntimeError("No reward model parameters loaded (Theta or b).")
 
     def clone(self, seed: int | None = None) -> "SimBanditEnv":
-        """Shallow-copy the environment with an independent RNG."""
         if seed is None:
             seed = int(self.rng.integers(0, 2**32 - 1))
         rng = np.random.default_rng(int(seed))
@@ -75,11 +73,15 @@ class SimBanditEnv:
             delay_pool=self.delay_pool,
             censor_steps=int(self.censor_steps),
             Theta=self.Theta,
+            intercept=self.intercept,
             w=self.w,
             b=self.b,
             meta=self.meta,
             context_index=self.context_index,
             context_split=self.context_split,
+            reward_model=self.reward_model,
+            delay_values_by_arm=self.delay_values_by_arm,
+            delay_offsets_by_arm=self.delay_offsets_by_arm,
         )
 
     def with_delays(
@@ -89,23 +91,20 @@ class SimBanditEnv:
         censor_steps: int | None = None,
         seed: int | None = None,
     ) -> "SimBanditEnv":
-        """Clone env and optionally override delay behavior."""
         env = self.clone(seed=seed)
         if delay_pool is not None:
             env.delay_pool = np.asarray(delay_pool, dtype=np.int32).reshape(-1)
+            env.delay_values_by_arm = None
+            env.delay_offsets_by_arm = None
         if censor_steps is not None:
             env.censor_steps = max(0, int(censor_steps))
         return env
 
     def make_no_delay(self, seed: int | None = None) -> "SimBanditEnv":
-        """Return a no-delay variant (D_t ≡ 0 for both r=0 and r=1)."""
         return self.with_delays(delay_pool=np.array([0], dtype=np.int32), censor_steps=0, seed=seed)
-
-    # ------------------------ helpers ------------------------
 
     @staticmethod
     def _make_costs(K: int, cost_mode: str, seed: int) -> np.ndarray:
-        """Fallback ONLY if real costs file is missing."""
         if cost_mode == "lin":
             if K == 1:
                 return np.array([1.0], dtype=np.float32)
@@ -122,7 +121,6 @@ class SimBanditEnv:
         pool_size: int = 200_000,
         max_tries: int = 2_000_000,
     ) -> np.ndarray:
-        """Fallback: sample non-negative delays from D (D>=0)."""
         n = int(D.shape[0])
         pool = np.empty((0,), dtype=np.int32)
         tries = 0
@@ -142,11 +140,10 @@ class SimBanditEnv:
     def _compute_theta_from_arm_stats(
         meta_stats: np.lib.npyio.NpzFile, K: int, d: int, ridge_lambda: float
     ) -> np.ndarray | None:
-        """Optional: compute per-arm ridge Theta from stored XtX_arm/XtR_arm."""
         if ("XtX_arm" not in meta_stats.files) or ("XtR_arm" not in meta_stats.files):
             return None
-        XtX_arm = meta_stats["XtX_arm"].astype(np.float64)  # (K,d,d)
-        XtR_arm = meta_stats["XtR_arm"].astype(np.float64)  # (K,d)
+        XtX_arm = meta_stats["XtX_arm"].astype(np.float64)
+        XtR_arm = meta_stats["XtR_arm"].astype(np.float64)
         if XtX_arm.shape != (K, d, d):
             raise ValueError(f"XtX_arm shape mismatch: expected {(K, d, d)}, got {XtX_arm.shape}")
         if XtR_arm.shape != (K, d):
@@ -158,7 +155,14 @@ class SimBanditEnv:
             Theta[a] = np.linalg.solve(XtX_arm[a] + ridge_lambda * I, XtR_arm[a])
         return Theta.astype(np.float32)
 
-    # ------------------------ loading ------------------------
+    @staticmethod
+    def _load_arm_delay_pools(path: Path) -> tuple[np.ndarray | None, np.ndarray | None]:
+        if not path.exists():
+            return None, None
+        data = np.load(path, allow_pickle=False)
+        if ("values" not in data.files) or ("offsets" not in data.files):
+            raise ValueError(f"{path} missing required keys 'values' and 'offsets'")
+        return data["values"].astype(np.int32), data["offsets"].astype(np.int64)
 
     @classmethod
     def from_memmap_dir(
@@ -170,17 +174,14 @@ class SimBanditEnv:
         delay_pool_size: int = 200_000,
         normalize_costs: bool = True,
         context_split: str = "auto",
+        reward_model: str = "auto",
     ) -> "SimBanditEnv":
-        """
-        Load an environment from a memmap directory created by make_criteo_attrib_memmap_full.py.
+        if context_split not in {"auto", "all", "train", "test"}:
+            raise ValueError("context_split must be one of: auto, all, train, test")
+        if reward_model not in {"auto", "linear_clip", "logistic"}:
+            raise ValueError("reward_model must be one of: auto, linear_clip, logistic")
 
-        NOTE: `seed` affects:
-          - RNG used for reward/delay sampling in this env instance
-          - optional subsampling of delay_pool to delay_pool_size
-        For order-independent evaluation, load once and then use env.clone(seed=...) per run.
-        """
         p = Path(memmap_dir)
-
         meta_stats = np.load(p / "meta_and_stats.npz", allow_pickle=True)
         meta = meta_stats["meta"].item()
         n = int(meta["n"])
@@ -188,8 +189,6 @@ class SimBanditEnv:
         K = int(meta["k_cap"])
         has_split = bool(meta.get("has_split", False)) and (p / "split.npy").exists()
 
-        if context_split not in {"auto", "all", "train", "test"}:
-            raise ValueError("context_split must be one of: auto, all, train, test")
         if context_split == "auto":
             effective_context_split = "test" if has_split and int(meta.get("n_test", 0)) > 0 else "all"
         else:
@@ -208,7 +207,6 @@ class SimBanditEnv:
             if n <= np.iinfo(np.uint32).max:
                 context_index = context_index.astype(np.uint32, copy=False)
 
-        # ---- censor window W (in steps) ----
         censor_steps = int(meta.get("censor_steps", meta.get("max_delay", meta.get("d_max", 0))))
         censor_steps = max(0, censor_steps)
 
@@ -221,7 +219,6 @@ class SimBanditEnv:
 
         rng = np.random.default_rng(seed)
 
-        # ---- delays: prefer precomputed positive delays ----
         delays_path = p / "delays_pos.npy"
         if delays_path.exists():
             delay_pool = np.load(delays_path).astype(np.int32).reshape(-1)
@@ -229,26 +226,22 @@ class SimBanditEnv:
         else:
             delay_pool = cls._build_delay_pool(D, rng, pool_size=delay_pool_size)
 
-        # keep delays within censor window if censor_steps>0
         if censor_steps > 0 and delay_pool.size > 0:
             delay_pool = delay_pool[delay_pool <= censor_steps]
-
-        # optional downsample
         if delay_pool.size > delay_pool_size:
             idx = rng.choice(delay_pool.size, size=delay_pool_size, replace=False)
             delay_pool = delay_pool[idx]
         delay_pool = delay_pool.astype(np.int32)
 
-        # ---- costs: prefer real per-arm costs ----
+        delay_values_by_arm, delay_offsets_by_arm = cls._load_arm_delay_pools(p / "delays_pos_by_arm.npz")
+
         costs_path = p / "costs_by_arm.npy"
         if costs_path.exists():
             raw_costs = np.load(costs_path).astype(np.float64).reshape(-1)
             if raw_costs.shape[0] != K:
                 raise ValueError(f"costs_by_arm.npy shape mismatch: expected {(K,)}, got {raw_costs.shape}")
-
             costs = raw_costs.copy()
 
-            # normalize to mean~1 to keep budget_ratio=B/T interpretable
             if normalize_costs:
                 cnt = None
                 if "cnt_arm" in meta_stats.files:
@@ -260,15 +253,54 @@ class SimBanditEnv:
                     mean_cost = float(np.sum(costs * cnt) / np.sum(cnt))
                 else:
                     mean_cost = float(np.mean(costs))
-
-                mean_cost = max(mean_cost, 1e-12)
-                costs = costs / mean_cost
+                costs = costs / max(mean_cost, 1e-12)
 
             costs = costs.astype(np.float32)
         else:
             costs = cls._make_costs(K, cost_mode=cost_mode, seed=seed)
 
-        # ---- reward model: prefer arm-specific Theta ----
+        meta_loaded = dict(meta)
+        meta_loaded["context_split"] = effective_context_split
+
+        logistic_path = p / "arm_logistic_stats.npz"
+        if reward_model in {"auto", "logistic"} and logistic_path.exists():
+            logi = np.load(logistic_path, allow_pickle=True)
+            if "Theta" not in logi.files or "bias" not in logi.files:
+                raise ValueError("arm_logistic_stats.npz exists but is missing Theta/bias")
+            logi_row_split = "all"
+            if "row_split" in logi.files:
+                raw_split = logi["row_split"]
+                logi_row_split = str(raw_split.item() if getattr(raw_split, "shape", ()) == () else raw_split)
+            use_logi = not (
+                has_split and str(meta.get("fit_split", "all")) == "train" and logi_row_split not in {"train", "fit"}
+            )
+            if use_logi:
+                Theta = logi["Theta"].astype(np.float32)
+                intercept = logi["bias"].astype(np.float32).reshape(-1)
+                if Theta.shape != (K, d):
+                    raise ValueError(f"Logistic Theta shape mismatch: expected {(K, d)}, got {Theta.shape}")
+                if intercept.shape[0] != K:
+                    raise ValueError(f"Logistic bias shape mismatch: expected {(K,)}, got {intercept.shape}")
+                meta_loaded["reward_model_loaded"] = "logistic"
+                return cls(
+                    X_data=X,
+                    D_data=D,
+                    costs=costs,
+                    rng=rng,
+                    delay_pool=delay_pool,
+                    censor_steps=censor_steps,
+                    Theta=Theta,
+                    intercept=intercept,
+                    meta=meta_loaded,
+                    context_index=context_index,
+                    context_split=effective_context_split,
+                    reward_model="logistic",
+                    delay_values_by_arm=delay_values_by_arm,
+                    delay_offsets_by_arm=delay_offsets_by_arm,
+                )
+        elif reward_model == "logistic":
+            raise ValueError(f"Requested reward_model=logistic, but {logistic_path} does not exist")
+
         arm_path = p / "arm_ridge_stats.npz"
         if arm_path.exists():
             arm = np.load(arm_path, allow_pickle=True)
@@ -276,15 +308,16 @@ class SimBanditEnv:
             if "row_split" in arm.files:
                 raw_split = arm["row_split"]
                 arm_row_split = str(raw_split.item() if getattr(raw_split, "shape", ()) == () else raw_split)
-            use_arm_file = not (has_split and str(meta.get("fit_split", "all")) == "train" and arm_row_split not in {"train", "fit"})
+            use_arm_file = not (
+                has_split and str(meta.get("fit_split", "all")) == "train" and arm_row_split not in {"train", "fit"}
+            )
             if use_arm_file:
                 if "Theta" not in arm.files:
                     raise ValueError("arm_ridge_stats.npz exists but has no 'Theta'")
                 Theta = arm["Theta"].astype(np.float32)
                 if Theta.shape != (K, d):
                     raise ValueError(f"Theta shape mismatch: expected {(K, d)}, got {Theta.shape}")
-                meta_loaded = dict(meta)
-                meta_loaded["context_split"] = effective_context_split
+                meta_loaded["reward_model_loaded"] = "linear_clip"
                 return cls(
                     X_data=X,
                     D_data=D,
@@ -296,12 +329,14 @@ class SimBanditEnv:
                     meta=meta_loaded,
                     context_index=context_index,
                     context_split=effective_context_split,
+                    reward_model="linear_clip",
+                    delay_values_by_arm=delay_values_by_arm,
+                    delay_offsets_by_arm=delay_offsets_by_arm,
                 )
 
         Theta = cls._compute_theta_from_arm_stats(meta_stats, K=K, d=d, ridge_lambda=ridge_lambda)
         if Theta is not None:
-            meta_loaded = dict(meta)
-            meta_loaded["context_split"] = effective_context_split
+            meta_loaded["reward_model_loaded"] = "linear_clip"
             return cls(
                 X_data=X,
                 D_data=D,
@@ -313,12 +348,14 @@ class SimBanditEnv:
                 meta=meta_loaded,
                 context_index=context_index,
                 context_split=effective_context_split,
+                reward_model="linear_clip",
+                delay_values_by_arm=delay_values_by_arm,
+                delay_offsets_by_arm=delay_offsets_by_arm,
             )
 
-        # ---- fallback: global linear w + per-arm bias b ----
         if ("XtX" not in meta_stats.files) or ("XtR" not in meta_stats.files):
             raise ValueError(
-                "No arm-specific reward model found (Theta / XtX_arm+XtR_arm), "
+                "No arm-specific reward model found (logistic / Theta / XtX_arm+XtR_arm), "
                 "and no global (XtX, XtR) stats present. "
                 f"Available keys: {list(meta_stats.files)}"
             )
@@ -327,11 +364,9 @@ class SimBanditEnv:
         XtR = meta_stats["XtR"].astype(np.float64)
         w = np.linalg.solve(XtX + ridge_lambda * np.eye(d), XtR).astype(np.float32)
 
-        # per-arm bias: try common key variants
         sum_r = None
         cnt = None
         sum_x = None
-
         if ("sum_r_arm" in meta_stats.files) and ("cnt_arm" in meta_stats.files) and ("sum_x_arm" in meta_stats.files):
             sum_r = meta_stats["sum_r_arm"].astype(np.float64)
             cnt = meta_stats["cnt_arm"].astype(np.float64)
@@ -348,8 +383,7 @@ class SimBanditEnv:
             mean_x = sum_x / np.maximum(cnt[:, None], 1.0)
             b = (mean_r - (mean_x @ w.astype(np.float64))).astype(np.float32)
 
-        meta_loaded = dict(meta)
-        meta_loaded["context_split"] = effective_context_split
+        meta_loaded["reward_model_loaded"] = "global_linear_clip"
         return cls(
             X_data=X,
             D_data=D,
@@ -362,12 +396,12 @@ class SimBanditEnv:
             meta=meta_loaded,
             context_index=context_index,
             context_split=effective_context_split,
+            reward_model="global_linear_clip",
+            delay_values_by_arm=delay_values_by_arm,
+            delay_offsets_by_arm=delay_offsets_by_arm,
         )
 
-    # ------------------------ interaction ------------------------
-
     def sample_contexts(self, T: int, rng: np.random.Generator | None = None) -> np.ndarray:
-        """Sample a context sequence. Use a dedicated rng for paired comparisons."""
         rng = self.rng if rng is None else rng
         if self.context_index is None:
             idx = rng.integers(0, self.n, size=int(T))
@@ -376,33 +410,60 @@ class SimBanditEnv:
             idx = self.context_index[pool_idx]
         return np.asarray(self.X_data[idx], dtype=np.float32)
 
-    def step(self, x: np.ndarray, a: int) -> tuple[float, float, int]:
-        """
-        Returns: (reward r in {0,1}, cost c, delay dly in {0,1,2,...})
-
-        Delay semantics:
-          - r=1: dly ~ delay_pool (or 0 if pool empty)
-          - r=0: dly = censor_steps (or 0 if censor_steps==0)
-        """
+    def predict_prob(self, x: np.ndarray, a: int) -> float:
         a = int(a)
-        x64 = x.astype(np.float64)
+        x64 = x.astype(np.float64, copy=False)
 
         if self.Theta is not None:
-            mu = float(np.clip(self.Theta[a].astype(np.float64) @ x64, 0.0, 1.0))
-        else:
-            mu = float(np.clip(self.w.astype(np.float64) @ x64 + float(self.b[a]), 0.0, 1.0))
+            if self.reward_model == "logistic":
+                bias = 0.0 if self.intercept is None else float(self.intercept[a])
+                return float(sigmoid(float(self.Theta[a].astype(np.float64) @ x64) + bias))
+            return float(np.clip(self.Theta[a].astype(np.float64) @ x64, 0.0, 1.0))
 
+        return float(np.clip(self.w.astype(np.float64) @ x64 + float(self.b[a]), 0.0, 1.0))
+
+    def predict_prob_batch(self, X: np.ndarray, arms: np.ndarray) -> np.ndarray:
+        X64 = np.asarray(X, dtype=np.float64)
+        arms = np.asarray(arms, dtype=np.int64)
+
+        if self.Theta is not None:
+            theta = self.Theta[arms].astype(np.float64)
+            scores = np.sum(theta * X64, axis=1)
+            if self.reward_model == "logistic":
+                if self.intercept is not None:
+                    scores = scores + self.intercept[arms].astype(np.float64)
+                return np.asarray(sigmoid(scores), dtype=np.float64)
+            return np.clip(scores, 0.0, 1.0)
+
+        scores = X64 @ self.w.astype(np.float64) + self.b[arms].astype(np.float64)
+        return np.clip(scores, 0.0, 1.0)
+
+    def _sample_positive_delay(self, a: int) -> int:
+        if self.delay_values_by_arm is not None and self.delay_offsets_by_arm is not None:
+            lo = int(self.delay_offsets_by_arm[a])
+            hi = int(self.delay_offsets_by_arm[a + 1])
+            if hi > lo:
+                j = int(self.rng.integers(lo, hi))
+                dly = int(self.delay_values_by_arm[j])
+                if self.censor_steps > 0:
+                    dly = min(dly, self.censor_steps)
+                return max(dly, 0)
+
+        if self.delay_pool.size > 0:
+            dly = int(self.rng.choice(self.delay_pool))
+            if self.censor_steps > 0:
+                dly = min(dly, self.censor_steps)
+            return max(dly, 0)
+        return 0
+
+    def step(self, x: np.ndarray, a: int) -> tuple[float, float, int]:
+        a = int(a)
+        mu = self.predict_prob(x, a)
         r = float(self.rng.random() < mu)
         c = float(self.costs[a])
 
         if r > 0.0:
-            if self.delay_pool.size > 0:
-                dly = int(self.rng.choice(self.delay_pool))
-                dly = max(dly, 0)
-                if self.censor_steps > 0:
-                    dly = min(dly, self.censor_steps)
-            else:
-                dly = 0
+            dly = self._sample_positive_delay(a)
         else:
             dly = int(self.censor_steps) if self.censor_steps > 0 else 0
 

@@ -13,11 +13,18 @@ import argparse
 import csv
 from math import sqrt
 import numpy as np
+
+import src.eval.mpl_setup  # noqa: F401
 import matplotlib.pyplot as plt
 
 from src.env.sim_bandit_env import SimBanditEnv
 from src.algos.linucb_pd_delayed import DisjointLinUCB, PrimalDualLinUCB
 from src.algos.cost_normalized_ucb import CostNormalizedDisjointUCB
+from src.algos.logistic_ucb_delayed import (
+    CostNormalizedDisjointLogisticUCB,
+    DisjointLogisticUCB,
+    PrimalDualLogisticUCB,
+)
 from src.algos.context_free_bwk import ContextFreePrimalDualBwK
 from src.eval.runner_utils import (
     RunResult,
@@ -70,6 +77,80 @@ def plot_mean_ci(ax, x: np.ndarray, curves: np.ndarray, label: str, color=None):
     ax.fill_between(x, mean - ci, mean + ci, alpha=0.18, color=color)
 
 
+def build_algorithms(env_base: SimBanditEnv, args, seed: int):
+    if args.policy_model == "logistic":
+        lin = DisjointLogisticUCB(
+            env_base.K,
+            env_base.d,
+            alpha=args.alpha_lin,
+            lam=args.lam,
+            seed=seed + 101,
+        )
+        pd = PrimalDualLogisticUCB(
+            env_base.K,
+            env_base.d,
+            costs=env_base.costs,
+            alpha=args.alpha_pd,
+            lam=args.lam,
+            eta=args.eta_pd,
+            seed=seed + 102,
+        )
+        cnu = CostNormalizedDisjointLogisticUCB(
+            env_base.K,
+            env_base.d,
+            costs=env_base.costs,
+            alpha=args.alpha_cnu,
+            lam=args.lam,
+            mode=args.mode_cnu,
+            gamma=args.gamma_cnu,
+            eps=args.eps_cnu,
+            seed=seed + 103,
+        )
+        labels = {
+            "lin": "LogisticUCB",
+            "pd": "PD-LogisticUCB",
+            "cnu": f"CostNormLogisticUCB[{args.mode_cnu}]",
+            "cf": "CF-PD-BwK",
+        }
+    else:
+        lin = DisjointLinUCB(env_base.K, env_base.d, alpha=args.alpha_lin, lam=args.lam, seed=seed + 101)
+        pd = PrimalDualLinUCB(
+            env_base.K,
+            env_base.d,
+            costs=env_base.costs,
+            alpha=args.alpha_pd,
+            lam=args.lam,
+            eta=args.eta_pd,
+            seed=seed + 102,
+        )
+        cnu = CostNormalizedDisjointUCB(
+            env_base.K,
+            env_base.d,
+            costs=env_base.costs,
+            alpha=args.alpha_cnu,
+            lam=args.lam,
+            mode=args.mode_cnu,
+            gamma=args.gamma_cnu,
+            eps=args.eps_cnu,
+            seed=seed + 103,
+        )
+        labels = {
+            "lin": "LinUCB",
+            "pd": "PD-LinUCB",
+            "cnu": f"CostNormUCB[{args.mode_cnu}]",
+            "cf": "CF-PD-BwK",
+        }
+
+    cf = ContextFreePrimalDualBwK(
+        env_base.K,
+        costs=env_base.costs,
+        alpha=args.alpha_cf,
+        eta=args.eta_cf,
+        seed=seed + 104,
+    )
+    return lin, pd, cnu, cf, labels
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--memmap_dir", type=str, required=True)
@@ -85,6 +166,20 @@ def main():
         default="auto",
         choices=["auto", "all", "train", "test"],
         help="Which context split to sample from. 'auto' uses test when split metadata exists.",
+    )
+    ap.add_argument(
+        "--reward_model",
+        type=str,
+        default="auto",
+        choices=["auto", "linear_clip", "logistic"],
+        help="Reward model used by the simulator.",
+    )
+    ap.add_argument(
+        "--policy_model",
+        type=str,
+        default="linear",
+        choices=["linear", "logistic"],
+        help="Online contextual learner family used by LinUCB / PD / CostNorm baselines.",
     )
 
     # LinUCB / PD-LinUCB
@@ -122,6 +217,7 @@ def main():
         ridge_lambda=1.0,
         cost_mode="lin",
         context_split=args.context_split,
+        reward_model=args.reward_model,
     )
     seeds = [int(args.seed0 + i) for i in range(int(args.n_seeds))]
 
@@ -132,6 +228,7 @@ def main():
         "cf": {"reward": [], "spent": [], "tau": [], "cum_r": [], "cum_c": []},
     }
     example: dict[str, RunResult] = {}
+    labels = {}
 
     for si, seed in enumerate(seeds):
         rng_ctx = np.random.default_rng(seed)
@@ -142,34 +239,7 @@ def main():
         env_cnu = env_base.clone(seed=seed + 10_003)
         env_cf = env_base.clone(seed=seed + 10_004)
 
-        lin = DisjointLinUCB(env_base.K, env_base.d, alpha=args.alpha_lin, lam=args.lam, seed=seed + 101)
-        pd = PrimalDualLinUCB(
-            env_base.K,
-            env_base.d,
-            costs=env_base.costs,
-            alpha=args.alpha_pd,
-            lam=args.lam,
-            eta=args.eta_pd,
-            seed=seed + 102,
-        )
-        cnu = CostNormalizedDisjointUCB(
-            env_base.K,
-            env_base.d,
-            costs=env_base.costs,
-            alpha=args.alpha_cnu,
-            lam=args.lam,
-            mode=args.mode_cnu,
-            gamma=args.gamma_cnu,
-            eps=args.eps_cnu,
-            seed=seed + 103,
-        )
-        cf = ContextFreePrimalDualBwK(
-            env_base.K,
-            costs=env_base.costs,
-            alpha=args.alpha_cf,
-            eta=args.eta_cf,
-            seed=seed + 104,
-        )
+        lin, pd, cnu, cf, labels = build_algorithms(env_base, args, seed)
 
         res_lin = run_contextual_delayed(
             env_lin, X_seq, lin, args.budget_ratio, bool(args.stop_at_budget), is_primal_dual=False
@@ -201,6 +271,8 @@ def main():
                     "T": args.T,
                     "budget_ratio": args.budget_ratio,
                     "stop_at_budget": int(args.stop_at_budget),
+                    "reward_model": args.reward_model,
+                    "policy_model": args.policy_model,
                     "alpha_lin": args.alpha_lin,
                     "alpha_pd": args.alpha_pd,
                     "eta_pd": args.eta_pd,
@@ -245,10 +317,10 @@ def main():
         }
 
     rows = [
-        summarize_method("lin", "LinUCB"),
-        summarize_method("pd", "PD-LinUCB"),
-        summarize_method("cnu", f"CostNormUCB[{args.mode_cnu}]"),
-        summarize_method("cf", "CF-PD-BwK"),
+        summarize_method("lin", labels["lin"]),
+        summarize_method("pd", labels["pd"]),
+        summarize_method("cnu", labels["cnu"]),
+        summarize_method("cf", labels["cf"]),
     ]
 
     main_ci_path = tab_dir / "main_ci.tex"
@@ -281,10 +353,10 @@ def main():
 
     # ---------------- Figure 1: cumulative reward ----------------
     plt.figure()
-    plt.plot(x, example["lin"].cum_r, label="LinUCB")
-    plt.plot(x, example["pd"].cum_r, label="PD-LinUCB")
-    plt.plot(x, example["cnu"].cum_r, label=f"CostNormUCB[{args.mode_cnu}]")
-    plt.plot(x, example["cf"].cum_r, label="CF-PD-BwK")
+    plt.plot(x, example["lin"].cum_r, label=labels["lin"])
+    plt.plot(x, example["pd"].cum_r, label=labels["pd"])
+    plt.plot(x, example["cnu"].cum_r, label=labels["cnu"])
+    plt.plot(x, example["cf"].cum_r, label=labels["cf"])
     plt.title("Cumulative reward (example run, stop-at-budget)")
     plt.xlabel("t")
     plt.ylabel("reward")
@@ -295,10 +367,10 @@ def main():
     plt.close()
 
     plt.figure()
-    plt.plot(x, example["lin"].cum_c, label="LinUCB")
-    plt.plot(x, example["pd"].cum_c, label="PD-LinUCB")
-    plt.plot(x, example["cnu"].cum_c, label=f"CostNormUCB[{args.mode_cnu}]")
-    plt.plot(x, example["cf"].cum_c, label="CF-PD-BwK")
+    plt.plot(x, example["lin"].cum_c, label=labels["lin"])
+    plt.plot(x, example["pd"].cum_c, label=labels["pd"])
+    plt.plot(x, example["cnu"].cum_c, label=labels["cnu"])
+    plt.plot(x, example["cf"].cum_c, label=labels["cf"])
     plt.axhline(B, linestyle="--", label="Budget B")
     plt.title("Cumulative cost (example run, stop-at-budget)")
     plt.xlabel("t")
@@ -311,10 +383,10 @@ def main():
     plt.close()
 
     plt.figure()
-    plt.plot(x, example["lin"].cum_c, label="LinUCB")
-    plt.plot(x, example["pd"].cum_c, label="PD-LinUCB")
-    plt.plot(x, example["cnu"].cum_c, label=f"CostNormUCB[{args.mode_cnu}]")
-    plt.plot(x, example["cf"].cum_c, label="CF-PD-BwK")
+    plt.plot(x, example["lin"].cum_c, label=labels["lin"])
+    plt.plot(x, example["pd"].cum_c, label=labels["pd"])
+    plt.plot(x, example["cnu"].cum_c, label=labels["cnu"])
+    plt.plot(x, example["cf"].cum_c, label=labels["cf"])
     plt.plot(x, ideal, linestyle=":", label="Ideal spend (t/T)·B")
     plt.axhline(B, linestyle="--", label="Budget B")
     plt.title("Cumulative spend vs budget schedule (example run)")
@@ -336,10 +408,10 @@ def main():
         plt.plot(t_axis, cbar, label=label)
 
     plt.figure()
-    plot_running_avg_cost(example["lin"], "LinUCB")
-    plot_running_avg_cost(example["pd"], "PD-LinUCB")
-    plot_running_avg_cost(example["cnu"], f"CostNormUCB[{args.mode_cnu}]")
-    plot_running_avg_cost(example["cf"], "CF-PD-BwK")
+    plot_running_avg_cost(example["lin"], labels["lin"])
+    plot_running_avg_cost(example["pd"], labels["pd"])
+    plot_running_avg_cost(example["cnu"], labels["cnu"])
+    plot_running_avg_cost(example["cf"], labels["cf"])
     plt.axhline(float(args.budget_ratio), linestyle="--", label=r"$\rho=B/T$")
     plt.title("Running-average cost per step (example run)")
     plt.xlabel("t (until stop)")
@@ -364,10 +436,10 @@ def main():
 
     plt.figure()
     ax = plt.gca()
-    plot_mean_ci(ax, x, lin_r, "LinUCB")
-    plot_mean_ci(ax, x, pd_r, "PD-LinUCB")
-    plot_mean_ci(ax, x, cnu_r, f"CostNormUCB[{args.mode_cnu}]")
-    plot_mean_ci(ax, x, cf_r, "CF-PD-BwK")
+    plot_mean_ci(ax, x, lin_r, labels["lin"])
+    plot_mean_ci(ax, x, pd_r, labels["pd"])
+    plot_mean_ci(ax, x, cnu_r, labels["cnu"])
+    plot_mean_ci(ax, x, cf_r, labels["cf"])
     ax.set_title("Cumulative reward (mean ± 95% CI over seeds)")
     ax.set_xlabel("t")
     ax.set_ylabel("reward")
@@ -379,10 +451,10 @@ def main():
 
     plt.figure()
     ax = plt.gca()
-    plot_mean_ci(ax, x, lin_c, "LinUCB")
-    plot_mean_ci(ax, x, pd_c, "PD-LinUCB")
-    plot_mean_ci(ax, x, cnu_c, f"CostNormUCB[{args.mode_cnu}]")
-    plot_mean_ci(ax, x, cf_c, "CF-PD-BwK")
+    plot_mean_ci(ax, x, lin_c, labels["lin"])
+    plot_mean_ci(ax, x, pd_c, labels["pd"])
+    plot_mean_ci(ax, x, cnu_c, labels["cnu"])
+    plot_mean_ci(ax, x, cf_c, labels["cf"])
     ax.axhline(B, linestyle="--", label="Budget B", color="black", linewidth=1.0)
     ax.set_title("Cumulative cost (mean ± 95% CI over seeds)")
     ax.set_xlabel("t")

@@ -13,16 +13,20 @@ a strict stop-at-budget feasible-set protocol, and comparisons between:
 
 This repo implements a semi-synthetic simulator:
 
-- Contexts `x_t` are sampled from the logged Criteo dataset.
-- Rewards are generated from an offline-fitted arm-specific ridge model
-  `mu_a(x)=clip(theta_a^T x,0,1)` with `r ~ Bernoulli(mu_a(x))`.
+- Contexts `x_t` are sampled from the logged Criteo dataset, with a default temporal train/test split.
+- Rewards can be generated from either:
+  - an arm-specific clipped-linear ridge model `clip(theta_a^T x,0,1)`, or
+  - an arm-specific logistic model `sigmoid(theta_a^T x + b_a)`.
 - The online budget controller uses arm-level mean costs `c(a)` computed from the `cost` field
   and normalized to mean approximately 1. This is not per-event counterfactual cost control.
 - Delays:
-  - For `r=1`, delays are sampled from an empirical pool of positive conversion delays.
+  - For `r=1`, delays are sampled from empirical positive conversion delays, either globally or arm-conditionally.
   - For `r=0`, the environment uses censoring: delay equals `censor_steps = ceil(W/Δ)`.
   - In the default paper setting, `W/Δ = 5000` at `Δ=3600`, so `W=18,000,000` seconds
     (about 208.3 days).
+- The budget-sweep script now uses nested gamma tuning:
+  - tune `gamma` on a separate context split / seed set,
+  - evaluate the selected `gamma*` on held-out seeds.
 
 ## Paper artifacts
 
@@ -77,12 +81,12 @@ If the automatic download fails because the upstream URL changes, open the offic
 
 ## 2) Build a train/test memmap artifact
 
-For a leakage-clean split, fit the simulator on train rows and evaluate on test contexts. The command below creates one artifact with:
+For a leakage-clean split, fit the simulator on earlier rows and evaluate on later rows. The command below creates one artifact with:
 
 - full row memmaps (`X.npy`, `A.npy`, `R.npy`, `C.npy`, `D.npy`)
 - `split.npy` with `0=train`, `1=test`
 - train-only fit stats in `meta_and_stats.npz`
-- train-only `costs_by_arm.npy` and `delays_pos.npy`
+- train-only `costs_by_arm.npy`, `delays_pos.npy`, and `delays_pos_by_arm.npz`
 
 ```bash
 python -m src.env.make_criteo_attrib_memmap_full \
@@ -93,6 +97,7 @@ python -m src.env.make_criteo_attrib_memmap_full \
   --censor_seconds $((5000*3600)) \
   --d_max 5000 \
   --train_frac 0.8 \
+  --split_mode temporal \
   --split_seed 123
 ```
 
@@ -105,7 +110,41 @@ python -m src.env.compute_arm_ridge_stats_from_memmap \
   --lam 1.0 --out arm_ridge_stats.npz
 ```
 
-## 3) Run the full experiment suite on test contexts
+Optional: fit an arm-wise logistic simulator on the train split. This is the cleaner reward model if you want held-out calibration and informative negative labels in the simulator.
+
+```bash
+python -m src.env.compute_arm_logistic_stats_from_memmap \
+  --memmap_dir data/processed/criteo_full_k50_d64_real_split80 \
+  --split train \
+  --lam 1.0 \
+  --max_iter 8 \
+  --out arm_logistic_stats.npz
+```
+
+## 3) Run held-out simulator diagnostics
+
+Compare the fitted simulator against held-out rows before running policy sweeps:
+
+```bash
+python -m src.eval.run_simulator_diagnostics \
+  --memmap_dir data/processed/criteo_full_k50_d64_real_split80 \
+  --eval_split test \
+  --reward_models linear_clip,logistic \
+  --artifact_dir paper_artifacts
+```
+
+If you did not fit `arm_logistic_stats.npz`, use `--reward_models linear_clip` instead.
+
+Outputs:
+
+- `paper_artifacts/tables/simulator_diagnostics.csv`
+- `paper_artifacts/tables/simulator_diagnostics.tex`
+- `paper_artifacts/figures/simulator_calibration.png`
+- `paper_artifacts/figures/simulator_delay_cdf.png`
+- `paper_artifacts/figures/simulator_cost_train_vs_eval.png`
+- `paper_artifacts/figures/simulator_delay_by_arm.png`
+
+## 4) Run the experiment suite on held-out contexts
 
 All evaluation scripts support `--context_split auto`, which means:
 
@@ -120,12 +159,14 @@ export MPLCONFIGDIR="$(pwd)/.mplconfig"
 mkdir -p "$MPLCONFIGDIR"
 ```
 
-### Main comparison
+### Main comparison: original linear policy family
 
 ```bash
 python -m src.eval.run_compare_baselines \
   --memmap_dir data/processed/criteo_full_k50_d64_real_split80 \
   --context_split auto \
+  --reward_model linear_clip \
+  --policy_model linear \
   --T 5000 --budget_ratio 0.7 --stop_at_budget \
   --n_seeds 10 --seed0 123 \
   --artifact_dir paper_artifacts \
@@ -148,6 +189,8 @@ Outputs:
 python -m src.eval.run_gamma_sweep \
   --memmap_dir data/processed/criteo_full_k50_d64_real_split80 \
   --context_split auto \
+  --reward_model linear_clip \
+  --policy_model linear \
   --T 5000 --budget_ratio 0.7 --stop_at_budget \
   --n_seeds 10 --seed0 123
 ```
@@ -165,6 +208,8 @@ Outputs:
 python -m src.eval.run_delay_ablation \
   --memmap_dir data/processed/criteo_full_k50_d64_real_split80 \
   --context_split auto \
+  --reward_model linear_clip \
+  --policy_model linear \
   --T 5000 --budget_ratio 0.7 --stop_at_budget \
   --n_seeds 10 --seed0 123 \
   --artifact_dir paper_artifacts
@@ -180,23 +225,46 @@ Output:
 python -m src.eval.run_budget_sweep_baselines \
   --memmap_dir data/processed/criteo_full_k50_d64_real_split80 \
   --context_split auto \
+  --reward_model linear_clip \
+  --policy_model linear \
   --T 5000 --stop_at_budget \
   --budgets 0.40,0.55,0.70,0.85 \
   --gammas 0,0.1,0.3,1,2,3,5,10 \
   --n_seeds 10 --seed0 123 \
+  --n_tune_seeds 10 --tune_seed0 10123 \
   --artifact_dir paper_artifacts
 ```
 
 Outputs:
 
-- `paper_artifacts/tables/budget_sweep_raw.csv`
+- `paper_artifacts/tables/budget_sweep_tuning_raw.csv`
+- `paper_artifacts/tables/budget_sweep_tuning_summary.csv`
+- `paper_artifacts/tables/budget_sweep_eval_raw.csv`
 - `paper_artifacts/tables/budget_sweep_summary.csv`
 - `paper_artifacts/tables/budget_sweep.tex`
 - `paper_artifacts/figures/budget_sweep_reward.png`
 - `paper_artifacts/figures/budget_sweep_gamma_star.png`
 - `paper_artifacts/figures/budget_sweep_spent.png`
 
-## 4) One-command evaluation runner
+### Stronger logistic setup
+
+If `arm_logistic_stats.npz` exists and you want the cleaner reward model plus contextual learners that update on delayed zeros, run:
+
+```bash
+python -m src.eval.run_compare_baselines \
+  --memmap_dir data/processed/criteo_full_k50_d64_real_split80 \
+  --context_split auto \
+  --reward_model logistic \
+  --policy_model logistic \
+  --T 5000 --budget_ratio 0.7 --stop_at_budget \
+  --n_seeds 10 --seed0 123 \
+  --artifact_dir paper_artifacts/logistic \
+  --tag T5000_rho0.7_logistic
+```
+
+The same `--reward_model logistic --policy_model logistic` pair can be used with `run_gamma_sweep.py`, `run_delay_ablation.py`, and `run_budget_sweep_baselines.py`.
+
+## 5) One-command evaluation runner
 
 After preprocessing, you can run the full suite with:
 
@@ -204,6 +272,16 @@ After preprocessing, you can run the full suite with:
 bash scripts/run_full_paper_experiments.sh \
   data/processed/criteo_full_k50_d64_real_split80 \
   paper_artifacts
+```
+
+By default this runs with `REWARD_MODEL=linear_clip` and `POLICY_MODEL=linear`.
+To run the logistic setup end-to-end:
+
+```bash
+REWARD_MODEL=logistic POLICY_MODEL=logistic \
+bash scripts/run_full_paper_experiments.sh \
+  data/processed/criteo_full_k50_d64_real_split80 \
+  paper_artifacts/logistic
 ```
 
 When that finishes, the figures to upload to Overleaf are in `paper_artifacts/figures/`, and the LaTeX tabulars are in `paper_artifacts/tables/`.

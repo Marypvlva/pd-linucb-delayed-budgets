@@ -15,6 +15,11 @@ from src.env.sim_bandit_env import SimBanditEnv
 from src.algos.linucb_pd_delayed import DisjointLinUCB, PrimalDualLinUCB
 from src.algos.cost_normalized_ucb import CostNormalizedDisjointUCB
 from src.algos.context_free_bwk import ContextFreePrimalDualBwK
+from src.algos.logistic_ucb_delayed import (
+    CostNormalizedDisjointLogisticUCB,
+    DisjointLogisticUCB,
+    PrimalDualLogisticUCB,
+)
 from src.eval.runner_utils import mean_ci, run_context_free_pd_delayed, run_contextual_delayed
 
 
@@ -57,6 +62,20 @@ def main():
         choices=["auto", "all", "train", "test"],
         help="Which context split to sample from. 'auto' uses test when split metadata exists.",
     )
+    ap.add_argument(
+        "--reward_model",
+        type=str,
+        default="auto",
+        choices=["auto", "linear_clip", "logistic"],
+        help="Reward model used by the simulator.",
+    )
+    ap.add_argument(
+        "--policy_model",
+        type=str,
+        default="linear",
+        choices=["linear", "logistic"],
+        help="Contextual learner family for LinUCB / PD / CostNorm baselines.",
+    )
 
     ap.add_argument("--alpha_lin", type=float, default=1.0)
     ap.add_argument("--alpha_pd", type=float, default=1.5)
@@ -82,8 +101,23 @@ def main():
         ridge_lambda=1.0,
         cost_mode="lin",
         context_split=args.context_split,
+        reward_model=args.reward_model,
     )
     seeds = [int(args.seed0 + i) for i in range(int(args.n_seeds))]
+    if args.policy_model == "logistic":
+        method_rows = [
+            ("lin", "LogisticUCB"),
+            ("pd", "PD-LogisticUCB"),
+            ("cnu", f"CostNormLogisticUCB[{args.mode_cnu}]"),
+            ("cf", "CF-PD-BwK"),
+        ]
+    else:
+        method_rows = [
+            ("lin", "LinUCB"),
+            ("pd", "PD-LinUCB"),
+            ("cnu", f"CostNormUCB[{args.mode_cnu}]"),
+            ("cf", "CF-PD-BwK"),
+        ]
 
     store = {
         "delayed": {"lin": [], "pd": [], "cnu": [], "cf": []},
@@ -105,27 +139,52 @@ def main():
                 env_cnu = env_base.make_no_delay(seed=seed + 20_003)
                 env_cf = env_base.make_no_delay(seed=seed + 20_004)
 
-            lin = DisjointLinUCB(env_base.K, env_base.d, alpha=args.alpha_lin, lam=args.lam, seed=seed + 101)
-            pd = PrimalDualLinUCB(
-                env_base.K,
-                env_base.d,
-                costs=env_base.costs,
-                alpha=args.alpha_pd,
-                lam=args.lam,
-                eta=args.eta_pd,
-                seed=seed + 102,
-            )
-            cnu = CostNormalizedDisjointUCB(
-                env_base.K,
-                env_base.d,
-                costs=env_base.costs,
-                alpha=args.alpha_cnu,
-                lam=args.lam,
-                mode=args.mode_cnu,
-                gamma=args.gamma_cnu,
-                eps=args.eps_cnu,
-                seed=seed + 103,
-            )
+            if args.policy_model == "logistic":
+                lin = DisjointLogisticUCB(
+                    env_base.K, env_base.d, alpha=args.alpha_lin, lam=args.lam, seed=seed + 101
+                )
+                pd = PrimalDualLogisticUCB(
+                    env_base.K,
+                    env_base.d,
+                    costs=env_base.costs,
+                    alpha=args.alpha_pd,
+                    lam=args.lam,
+                    eta=args.eta_pd,
+                    seed=seed + 102,
+                )
+                cnu = CostNormalizedDisjointLogisticUCB(
+                    env_base.K,
+                    env_base.d,
+                    costs=env_base.costs,
+                    alpha=args.alpha_cnu,
+                    lam=args.lam,
+                    mode=args.mode_cnu,
+                    gamma=args.gamma_cnu,
+                    eps=args.eps_cnu,
+                    seed=seed + 103,
+                )
+            else:
+                lin = DisjointLinUCB(env_base.K, env_base.d, alpha=args.alpha_lin, lam=args.lam, seed=seed + 101)
+                pd = PrimalDualLinUCB(
+                    env_base.K,
+                    env_base.d,
+                    costs=env_base.costs,
+                    alpha=args.alpha_pd,
+                    lam=args.lam,
+                    eta=args.eta_pd,
+                    seed=seed + 102,
+                )
+                cnu = CostNormalizedDisjointUCB(
+                    env_base.K,
+                    env_base.d,
+                    costs=env_base.costs,
+                    alpha=args.alpha_cnu,
+                    lam=args.lam,
+                    mode=args.mode_cnu,
+                    gamma=args.gamma_cnu,
+                    eps=args.eps_cnu,
+                    seed=seed + 103,
+                )
             cf = ContextFreePrimalDualBwK(
                 env_base.K,
                 costs=env_base.costs,
@@ -160,12 +219,7 @@ def main():
         return r_m, r_ci, s_m, s_ci, t_m, t_ci
 
     rows = []
-    for key, name in [
-        ("lin", "LinUCB"),
-        ("pd", "PD-LinUCB"),
-        ("cnu", f"CostNormUCB[{args.mode_cnu}]"),
-        ("cf", "CF-PD-BwK"),
-    ]:
+    for key, name in method_rows:
         rd_m, rd_ci, sd_m, sd_ci, td_m, td_ci = summarize("delayed", key)
         rn_m, rn_ci, sn_m, sn_ci, tn_m, tn_ci = summarize("nodelay", key)
         rows.append({
